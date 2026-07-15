@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS query_registry (
   query_text TEXT NOT NULL,
   query_hash TEXT NOT NULL,
   source_indicator_ids_json TEXT NOT NULL,
+  source_assertion_ids_json TEXT NOT NULL DEFAULT '[]',
+  source_available_at TEXT,
   source_feature_ids_json TEXT NOT NULL,
   developed_from_split TEXT NOT NULL,
   registered_at TEXT NOT NULL,
@@ -122,11 +124,25 @@ class QueryRegistry:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.executescript(SCHEMA)
+        self._migrate_phase_a_columns(connection)
         try:
             with connection:
                 yield connection
         finally:
             connection.close()
+
+    @staticmethod
+    def _migrate_phase_a_columns(connection: sqlite3.Connection) -> None:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(query_registry)")}
+        if "source_assertion_ids_json" not in columns:
+            connection.execute(
+                "ALTER TABLE query_registry ADD COLUMN source_assertion_ids_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "source_available_at" not in columns:
+            connection.execute(
+                "ALTER TABLE query_registry ADD COLUMN source_available_at TEXT"
+            )
 
     def register_query(
         self,
@@ -137,6 +153,8 @@ class QueryRegistry:
         developed_from_split: DatasetSplit,
         config_hash: str,
         source_indicator_ids: list[str] | None = None,
+        source_assertion_ids: list[str] | None = None,
+        source_available_at: datetime | None = None,
         source_feature_ids: list[str] | None = None,
         registered_at: datetime | None = None,
     ) -> QueryRecord:
@@ -152,6 +170,8 @@ class QueryRegistry:
             query_text=query_text,
             query_hash=query_hash,
             source_indicator_ids=source_indicator_ids or [],
+            source_assertion_ids=source_assertion_ids or [],
+            source_available_at=source_available_at,
             source_feature_ids=source_feature_ids or [],
             developed_from_split=developed_from_split,
             registered_at=registered_at or datetime.now(timezone.utc),
@@ -167,11 +187,19 @@ class QueryRegistry:
                     raise ValueError("query ID collision with different content")
                 return restored
             connection.execute(
-                "INSERT INTO query_registry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO query_registry "
+                "(query_id, query_version, query_class, query_text, query_hash, "
+                "source_indicator_ids_json, source_assertion_ids_json, source_available_at, "
+                "source_feature_ids_json, developed_from_split, registered_at, frozen_at, "
+                "valid_for_test_from, config_hash, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.query_id, record.query_version, record.query_class.value,
                     record.query_text, record.query_hash,
                     json.dumps(record.source_indicator_ids, sort_keys=True),
+                    json.dumps(record.source_assertion_ids, sort_keys=True),
+                    (record.source_available_at.isoformat()
+                     if record.source_available_at else None),
                     json.dumps(record.source_feature_ids, sort_keys=True),
                     record.developed_from_split.value, record.registered_at.isoformat(),
                     None, None, record.config_hash, record.status.value,
@@ -180,7 +208,17 @@ class QueryRegistry:
         return record
 
     def mark_validated(self, query_id: str) -> QueryRecord:
+        self._require_cti_assertion_provenance(self.get_query(query_id))
         return self._transition(query_id, QueryStatus.VALIDATED)
+
+    @staticmethod
+    def _require_cti_assertion_provenance(query: QueryRecord) -> None:
+        if query.query_class not in {QueryClass.Q0_SEED, QueryClass.Q1_DIRECT_PIVOT}:
+            return
+        if query.source_indicator_ids and (
+            not query.source_assertion_ids or query.source_available_at is None
+        ):
+            raise ValueError("CTI-derived query lacks accepted assertion provenance")
 
     def freeze_query(
         self, query_id: str, *, frozen_at: datetime, valid_for_test_from: datetime
@@ -190,6 +228,9 @@ class QueryRegistry:
         if valid_for_test_from < frozen_at:
             raise ValueError("valid_for_test_from cannot predate frozen_at")
         current = self.get_query(query_id)
+        self._require_cti_assertion_provenance(current)
+        if current.source_available_at and current.source_available_at > frozen_at:
+            raise ValueError("query source was not available by frozen_at")
         validate_transition(current.status, QueryStatus.FROZEN)
         with self.connect() as connection:
             connection.execute(
@@ -466,6 +507,11 @@ class QueryRegistry:
             query_class=QueryClass(row["query_class"]), query_text=row["query_text"],
             query_hash=row["query_hash"],
             source_indicator_ids=json.loads(row["source_indicator_ids_json"]),
+            source_assertion_ids=json.loads(row["source_assertion_ids_json"]),
+            source_available_at=(
+                datetime.fromisoformat(row["source_available_at"])
+                if row["source_available_at"] else None
+            ),
             source_feature_ids=json.loads(row["source_feature_ids_json"]),
             developed_from_split=DatasetSplit(row["developed_from_split"]),
             registered_at=datetime.fromisoformat(row["registered_at"]),

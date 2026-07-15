@@ -83,6 +83,15 @@ class CtiSearchConfig(StrictConfigModel):
         return normalized
 
 
+class CtiCorpusConfig(StrictConfigModel):
+    require_source_family: Literal[True] = True
+    require_source_access_class: Literal[True] = True
+    public_export_allowed_access_classes: list[Literal["public"]] = ["public"]
+    development_excluded_acquisition_modes: list[Literal["prospective_validation"]] = [
+        "prospective_validation"
+    ]
+
+
 class CensysCollectionConfig(StrictConfigModel):
     """Censys pagination·raw 저장·부분 실행 제외 정책."""
 
@@ -120,6 +129,7 @@ class ProjectConfig(StrictConfigModel):
     security: SecurityConfig
     query_policy: QueryPolicyConfig
     cti_search: CtiSearchConfig
+    cti_corpus: CtiCorpusConfig
     cti_ioc_extraction: CtiIocExtractionConfig
     censys_collection: CensysCollectionConfig
     config_path: Path | None = Field(default=None, exclude=True)

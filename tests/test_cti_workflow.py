@@ -19,7 +19,17 @@ from src.cti.workflow import (
     ManualScreeningInput, apply_manual_screening, run_search_stage,
     snapshot_included_candidates,
 )
-from src.models import ScreeningDecision
+from src.models import (
+    AcquisitionMode,
+    CorpusPurpose,
+    ScreeningDecision,
+    SourceAccessClass,
+    SourceDocumentRecord,
+    SourceFamilyRecord,
+    SourceRelationshipRecord,
+    SourceRelationshipType,
+    TimePrecision,
+)
 
 
 class Backend:
@@ -42,6 +52,119 @@ class Fetcher:
 
 
 class CtiWorkflowTests(unittest.TestCase):
+    def test_public_export_and_stage0_audit_fail_closed(self):
+        now = datetime(2026, 7, 13, tzinfo=timezone.utc)
+        family = SourceFamilyRecord(
+            source_family_id="family-public", canonical_document_id="doc-public",
+            reviewer_id="reviewer", reviewed_at=now,
+        )
+        public = SourceDocumentRecord(
+            document_id="doc-public", canonical_url="https://example.org/public",
+            publisher="example.org", title="Public", published_at=now,
+            published_at_raw="2026-07-13T00:00:00Z",
+            published_time_precision=TimePrecision.EXACT_TIMESTAMP,
+            source_timezone="UTC", retrieved_at=now, content_sha256="d" * 64,
+            acquisition_mode=AcquisitionMode.SYSTEMATIC_PUBLIC,
+            source_access_class=SourceAccessClass.PUBLIC,
+            corpus_purpose=CorpusPurpose.DEVELOPMENT,
+            source_family_id=family.source_family_id,
+        )
+        restricted_family = family.model_copy(update={
+            "source_family_id": "family-restricted",
+            "canonical_document_id": "doc-restricted",
+        })
+        restricted = public.model_copy(update={
+            "document_id": "doc-restricted",
+            "canonical_url": "local://restricted/report",
+            "content_sha256": "e" * 64,
+            "acquisition_mode": AcquisitionMode.EXISTING_CURATED,
+            "source_access_class": SourceAccessClass.RESTRICTED,
+            "source_family_id": restricted_family.source_family_id,
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            registry = CorpusRegistry(Path(directory) / "registry.sqlite")
+            registry.register_source_family(family, [])
+            registry.register_source_family(restricted_family, [])
+            registry.register_document(public)
+            registry.register_document(restricted)
+
+            exported = registry.public_source_manifest([public.document_id])
+            self.assertEqual("public", exported[0]["source_access_class"])
+            self.assertNotIn("normalized_value", exported[0])
+            with self.assertRaisesRegex(ValueError, "restricted source"):
+                registry.public_source_manifest([restricted.document_id])
+            self.assertTrue(registry.stage0_gate_report()["passed"])
+
+    def test_source_family_collapses_republication_to_one_independent_source(self):
+        reviewed_at = datetime(2026, 7, 13, tzinfo=timezone.utc)
+        family = SourceFamilyRecord(
+            source_family_id="family-example",
+            canonical_document_id="doc-original",
+            reviewer_id="human-reviewer",
+            reviewed_at=reviewed_at,
+        )
+        relationship = SourceRelationshipRecord(
+            relationship_id="relationship-translation",
+            source_family_id=family.source_family_id,
+            document_id="doc-translation",
+            related_document_id="doc-original",
+            relationship_type=SourceRelationshipType.TRANSLATION,
+            reviewer_id="human-reviewer",
+            reviewed_at=reviewed_at,
+        )
+        documents = [
+            SourceDocumentRecord(
+                document_id=document_id,
+                canonical_url=f"https://example.org/{document_id}",
+                publisher="example.org", title=document_id,
+                published_at=reviewed_at,
+                published_at_raw="2026-07-13T00:00:00Z",
+                published_time_precision=TimePrecision.EXACT_TIMESTAMP,
+                source_timezone="UTC", retrieved_at=reviewed_at,
+                content_sha256=content_hash,
+                acquisition_mode=AcquisitionMode.SYSTEMATIC_PUBLIC,
+                source_access_class=SourceAccessClass.PUBLIC,
+                corpus_purpose=CorpusPurpose.DEVELOPMENT,
+                source_family_id=family.source_family_id,
+            )
+            for document_id, content_hash in (
+                ("doc-original", "a" * 64),
+                ("doc-translation", "b" * 64),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            registry = CorpusRegistry(Path(directory) / "registry.sqlite")
+            effects = registry.register_source_family(family, [relationship])
+            for document in documents:
+                registry.register_document(document)
+
+            self.assertEqual(1, effects["relationships_inserted"])
+            self.assertEqual(
+                {"family-example"},
+                registry.independent_source_family_ids(
+                    ["doc-original", "doc-translation"]
+                ),
+            )
+            other_family = family.model_copy(update={
+                "source_family_id": "family-independent",
+                "canonical_document_id": "doc-independent",
+            })
+            registry.register_source_family(other_family, [])
+            registry.register_document(documents[0].model_copy(update={
+                "document_id": "doc-independent",
+                "canonical_url": "https://other.example/doc-independent",
+                "content_sha256": "c" * 64,
+                "source_family_id": other_family.source_family_id,
+            }))
+            self.assertEqual(
+                {"family-example", "family-independent"},
+                registry.independent_source_family_ids(
+                    ["doc-original", "doc-translation", "doc-independent"]
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "lack reviewed source family"):
+                registry.independent_source_family_ids(["doc-unreviewed"])
+
     def test_only_included_candidate_is_snapshotted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -51,7 +174,10 @@ class CtiWorkflowTests(unittest.TestCase):
                 version="1", target_date_from="2026-01-01", target_date_to="2026-07-13",
                 target_publishers=["example.org"], search_terms=["orb"],
                 inclusion_rules=["technical"], exclusion_rules=["marketing"],
-                deduplication_rule="canonical_url", registered_at=now,
+                deduplication_rule="canonical_url", research_cutoff_at=now,
+                source_access_class=SourceAccessClass.PUBLIC,
+                acquisition_mode=AcquisitionMode.SYSTEMATIC_PUBLIC,
+                registered_at=now,
             )
             result = run_search_stage(
                 protocol=protocol, expanded_queries=["orb"], backend=Backend(),
@@ -97,6 +223,8 @@ class CtiWorkflowTests(unittest.TestCase):
                 '[{"file":"My Original Report.pdf","text_file":"My Original Report OCR.txt",'
                 '"title":"Original Report",'
                 '"publisher":"Example","published_at":"2026-01-01T00:00:00Z",'
+                '"published_time_precision":"exact_timestamp","source_timezone":"UTC",'
+                '"source_access_class":"restricted","corpus_purpose":"development",'
                 '"source_independence":"commercial_cti_research"}]',
                 encoding="utf-8",
             )
@@ -108,6 +236,8 @@ class CtiWorkflowTests(unittest.TestCase):
             self.assertEqual("My Original Report.pdf", records[0]["original_filename"])
             self.assertEqual(original, source.read_bytes())
             self.assertEqual("existing_curated", records[0]["acquisition_mode"])
+            self.assertEqual("exact_timestamp", records[0]["published_time_precision"])
+            self.assertEqual("UTC", records[0]["source_timezone"])
             self.assertEqual(
                 "commercial_cti_research", records[0]["source_independence"]
             )

@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import tempfile
+import sqlite3
+from contextlib import closing
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -78,7 +80,60 @@ class QueryRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.registry.record_execution(execution)
 
+    def test_cti_query_validation_requires_assertion_provenance(self) -> None:
+        unsafe = self.registry.register_query(
+            query_version="v1", query_class=QueryClass.Q1_DIRECT_PIVOT,
+            query_text='host.dns.names: "relay.example.org"',
+            developed_from_split=DatasetSplit.DEVELOPMENT,
+            config_hash="config-hash", source_indicator_ids=["ioc-1"],
+            registered_at=self.t0,
+        )
+        with self.assertRaisesRegex(ValueError, "accepted assertion provenance"):
+            self.registry.mark_validated(unsafe.query_id)
+
+    def test_execution_cutoff_cannot_predate_query_source(self) -> None:
+        query = self.registry.register_query(
+            query_version="v1", query_class=QueryClass.Q1_DIRECT_PIVOT,
+            query_text='host.dns.names: "relay.example.net"',
+            developed_from_split=DatasetSplit.DEVELOPMENT,
+            config_hash="config-hash", source_indicator_ids=["ioc-2"],
+            source_assertion_ids=["assert-2"],
+            source_available_at=self.t0 + timedelta(days=1),
+            registered_at=self.t0 + timedelta(days=1),
+        )
+        execution = QueryExecutionRecord(
+            query_run_id="run-cutoff", query_id=query.query_id,
+            query_hash=query.query_hash, cutoff_time=self.t0,
+            executed_at=self.t0 + timedelta(days=2),
+            dataset_split=DatasetSplit.DEVELOPMENT,
+            result_count=0, result_manifest_hash="empty-result",
+            api_schema_version="fixture", status="success",
+        )
+        with self.assertRaisesRegex(ValueError, "available after execution cutoff"):
+            self.registry.record_execution(execution)
+
+    def test_legacy_query_table_gets_additive_phase_a_columns(self) -> None:
+        path = Path(self.temp.name) / "legacy.sqlite"
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("""
+                CREATE TABLE query_registry (
+                  query_id TEXT PRIMARY KEY, query_version TEXT NOT NULL,
+                  query_class TEXT NOT NULL, query_text TEXT NOT NULL,
+                  query_hash TEXT NOT NULL, source_indicator_ids_json TEXT NOT NULL,
+                  source_feature_ids_json TEXT NOT NULL,
+                  developed_from_split TEXT NOT NULL, registered_at TEXT NOT NULL,
+                  frozen_at TEXT, valid_for_test_from TEXT, config_hash TEXT NOT NULL,
+                  status TEXT NOT NULL
+                )
+            """)
+            connection.commit()
+        with QueryRegistry(path).connect() as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(query_registry)")
+            }
+        self.assertIn("source_assertion_ids_json", columns)
+        self.assertIn("source_available_at", columns)
+
 
 if __name__ == "__main__":
     unittest.main()
-

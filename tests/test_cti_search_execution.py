@@ -9,8 +9,9 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from src.cti.search_execution import execute_search_protocol
+from src.cti.search_execution import execute_search_protocol, infer_publication_metadata
 from src.cti.search_protocol import build_search_protocol
+from src.models import AcquisitionMode, SourceAccessClass, TimePrecision
 
 
 class FakeBackend:
@@ -32,6 +33,9 @@ class SearchExecutionTests(unittest.TestCase):
             target_publishers=["example.org"], search_terms=["orb"],
             inclusion_rules=["technical report"], exclusion_rules=["marketing"],
             deduplication_rule="canonical_url",
+            research_cutoff_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+            source_access_class=SourceAccessClass.PUBLIC,
+            acquisition_mode=AcquisitionMode.SYSTEMATIC_PUBLIC,
             registered_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
         )
         result = execute_search_protocol(
@@ -44,6 +48,60 @@ class SearchExecutionTests(unittest.TestCase):
         self.assertEqual(1, result.duplicate_count)
         self.assertEqual(1, result.discarded_outside_whitelist)
         self.assertEqual(1, result.discarded_invalid_url)
+        self.assertEqual("public", result.candidates[0].source_access_class)
+        self.assertEqual("systematic_public", result.candidates[0].acquisition_mode)
+        self.assertEqual("development", result.candidates[0].corpus_purpose)
+        self.assertEqual(
+            protocol.search_protocol_id, result.candidates[0].search_protocol_id
+        )
+
+    def test_protocol_hash_freezes_cutoff_access_and_acquisition_mode(self):
+        base = {
+            "version": "1",
+            "target_date_from": "2026-01-01",
+            "target_date_to": "2026-07-13",
+            "target_publishers": ["example.org"],
+            "search_terms": ["orb"],
+            "inclusion_rules": ["technical report"],
+            "exclusion_rules": ["marketing"],
+            "deduplication_rule": "canonical_url",
+            "research_cutoff_at": datetime(2026, 7, 13, tzinfo=timezone.utc),
+            "source_access_class": SourceAccessClass.PUBLIC,
+            "acquisition_mode": AcquisitionMode.SYSTEMATIC_PUBLIC,
+            "registered_at": datetime(2026, 7, 13, tzinfo=timezone.utc),
+        }
+        baseline = build_search_protocol(**base)
+        variants = [
+            build_search_protocol(
+                **{**base, "research_cutoff_at": datetime(2026, 7, 12, tzinfo=timezone.utc)}
+            ),
+            build_search_protocol(
+                **{**base, "source_access_class": SourceAccessClass.RESTRICTED}
+            ),
+            build_search_protocol(
+                **{**base, "acquisition_mode": AcquisitionMode.PROSPECTIVE_VALIDATION}
+            ),
+        ]
+        self.assertTrue(all(item.protocol_hash != baseline.protocol_hash for item in variants))
+
+    def test_protocol_rejects_naive_research_cutoff(self):
+        with self.assertRaises(ValueError):
+            build_search_protocol(
+                version="1", target_date_from="2026-01-01", target_date_to="2026-07-13",
+                target_publishers=["example.org"], search_terms=["orb"],
+                inclusion_rules=["technical report"], exclusion_rules=["marketing"],
+                deduplication_rule="canonical_url",
+                research_cutoff_at=datetime(2026, 7, 13),
+                source_access_class=SourceAccessClass.PUBLIC,
+                acquisition_mode=AcquisitionMode.SYSTEMATIC_PUBLIC,
+                registered_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+            )
+
+    def test_date_only_publication_is_not_promoted_to_exact_timestamp(self):
+        metadata = infer_publication_metadata("2026-01-01")
+        self.assertEqual(TimePrecision.DATE, metadata.precision)
+        self.assertIsNone(metadata.exact_datetime)
+        self.assertEqual("unknown", metadata.source_timezone)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import json
 import os
 import sys
 from dataclasses import asdict
-from datetime import datetime, time, timezone
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -42,7 +42,11 @@ from src.cti.ioc_extraction import (
     verify_indicator_candidates,
 )
 from src.cti.pivot_planning import register_pivot_plans
-from src.cti.search_execution import SearchCandidate, SearchExecutionResult
+from src.cti.search_execution import (
+    SearchCandidate,
+    SearchExecutionResult,
+    infer_publication_metadata,
+)
 from src.cti.snapshots import (
     ImmutableSnapshotStore,
     PassiveDocumentFetcher,
@@ -57,9 +61,15 @@ from src.cti.workflow import (
 from src.manifests import write_immutable_json
 from src.models import (
     AcquisitionMode,
+    AssertionReviewRecord,
+    CorpusPurpose,
     ScreeningDecision,
     SearchProtocolRecord,
     SourceDocumentRecord,
+    SourceFamilyRecord,
+    SourceRelationshipRecord,
+    SourceAccessClass,
+    TimePrecision,
 )
 from src.provenance import sha256_file, sha256_text
 
@@ -128,37 +138,56 @@ def _load_search_result(path: Path) -> SearchExecutionResult:
     )
 
 
-def _published_datetime(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        if "T" not in value:
-            return datetime.combine(parsed.date(), time.min, tzinfo=timezone.utc)
-        raise ValueError("publication timestamp must include timezone")
-    return parsed
-
-
 def _document_from_snapshot_metadata(
-    metadata: dict, published_at: datetime | None
+    metadata: dict,
+    published_at: str | None,
+    published_time_precision: str | None,
+    source_timezone: str | None,
+    source_family_id: str | None = None,
 ) -> SourceDocumentRecord:
-    published = published_at
-    if published is None:
-        if not metadata.get("published_at"):
-            raise ValueError(
-                "published_at is absent; provide --published-at after manual verification"
-            )
-        published = _published_datetime(metadata["published_at"])
+    published_raw = published_at or metadata.get("published_at")
+    precision_value = published_time_precision or metadata.get("published_time_precision")
+    timezone_value = source_timezone or metadata.get("source_timezone")
+    if not published_raw:
+        raise ValueError(
+            "published_at is absent; provide --published-at after manual verification"
+        )
+    if not precision_value or not timezone_value:
+        raise ValueError(
+            "published_time_precision and source_timezone are required"
+        )
+    precision = TimePrecision(str(precision_value))
+    publication = infer_publication_metadata(published_raw, str(timezone_value))
+    if precision in {
+        TimePrecision.EXACT_TIMESTAMP,
+        TimePrecision.DATE,
+        TimePrecision.MONTH,
+        TimePrecision.YEAR,
+    } and publication.precision is not precision:
+        raise ValueError("published_at does not match published_time_precision")
     return SourceDocumentRecord(
         document_id=metadata["document_id"],
         canonical_url=metadata["final_url"],
         publisher=metadata["publisher"],
         title=metadata["title"],
-        published_at=published,
-        retrieved_at=_published_datetime(metadata["retrieved_at"]),
-        content_sha256=metadata["content_sha256"],
-        acquisition_mode=AcquisitionMode(
-            metadata.get("acquisition_mode", AcquisitionMode.SYSTEMATIC_PUBLIC.value)
+        published_at=(
+            publication.exact_datetime
+            if precision is TimePrecision.EXACT_TIMESTAMP
+            else None
         ),
+        published_at_raw=str(published_raw),
+        published_time_precision=precision,
+        source_timezone=str(timezone_value),
+        retrieved_at=_datetime(metadata["retrieved_at"]),
+        content_sha256=metadata["content_sha256"],
+        text_content_sha256=metadata.get("text_content_sha256"),
+        acquisition_mode=AcquisitionMode(metadata["acquisition_mode"]),
+        source_access_class=SourceAccessClass(metadata["source_access_class"]),
+        corpus_purpose=CorpusPurpose(metadata["corpus_purpose"]),
+        search_protocol_id=metadata.get("search_protocol_id"),
+        discovery_query_id=metadata.get("candidate_id"),
         source_independence=str(metadata.get("source_independence", "unknown")),
+        source_family_id=source_family_id or metadata.get("source_family_id"),
     )
 
 
@@ -243,9 +272,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     q0 = subparsers.add_parser("register-q0", help="register an exact-IP Q0 seed query")
     q0.add_argument("--db", type=Path, required=True)
-    q0.add_argument("--indicator-id", required=True)
-    q0.add_argument("--ip", required=True)
-    q0.add_argument("--indicator-available-at", type=_datetime, required=True)
+    q0.add_argument("--source-assertion-id", required=True)
+    q0.add_argument("--cutoff-at", type=_datetime, required=True)
     q0.add_argument("--registered-at", type=_datetime, required=True)
     q0.add_argument("--version", required=True)
     q0.add_argument("--config-hash", required=True)
@@ -342,7 +370,11 @@ def build_parser() -> argparse.ArgumentParser:
     cti_verify.add_argument("--document-id")
     cti_verify.add_argument("--candidates", type=Path, required=True)
     cti_verify.add_argument("--cti-agent", type=Path, required=True)
-    cti_verify.add_argument("--published-at", type=_published_datetime)
+    cti_verify.add_argument("--published-at")
+    cti_verify.add_argument(
+        "--published-time-precision", choices=[item.value for item in TimePrecision]
+    )
+    cti_verify.add_argument("--source-timezone")
     cti_verify.add_argument("--available-at", type=_datetime, required=True)
     cti_verify.add_argument("--max-pdf-pages", type=int, default=500)
     cti_verify.add_argument("--max-document-chars", type=int, default=2_000_000)
@@ -357,7 +389,11 @@ def build_parser() -> argparse.ArgumentParser:
     cti_extract.add_argument("--cti-agent", type=Path, required=True)
     cti_extract.add_argument("--prompt", type=Path, required=True)
     cti_extract.add_argument("--model", required=True)
-    cti_extract.add_argument("--published-at", type=_published_datetime)
+    cti_extract.add_argument("--published-at")
+    cti_extract.add_argument(
+        "--published-time-precision", choices=[item.value for item in TimePrecision]
+    )
+    cti_extract.add_argument("--source-timezone")
     cti_extract.add_argument("--available-at", type=_datetime, required=True)
     cti_extract.add_argument("--max-input-chars", type=int, default=200_000)
     cti_extract.add_argument("--max-tokens", type=int, default=8192)
@@ -371,17 +407,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cti_register.add_argument("--verified-manifest", type=Path, required=True)
     cti_register.add_argument("--snapshot-metadata", type=Path, required=True)
+    cti_register.add_argument("--source-family-manifest", type=Path, required=True)
     cti_register.add_argument("--document-id")
     cti_register.add_argument("--db", type=Path, required=True)
-    cti_register.add_argument("--published-at", type=_published_datetime)
+    cti_register.add_argument("--published-at")
+    cti_register.add_argument(
+        "--published-time-precision", choices=[item.value for item in TimePrecision]
+    )
+    cti_register.add_argument("--source-timezone")
     cti_register.add_argument("--ingested-at", type=_datetime, required=True)
     cti_register.add_argument("--campaign-id")
     cti_register.add_argument("--out", type=Path, required=True)
 
+    cti_review = subparsers.add_parser(
+        "cti-review-assertions", help="persist immutable human assertion decisions"
+    )
+    cti_review.add_argument("--db", type=Path, required=True)
+    cti_review.add_argument("--reviews", type=Path, required=True)
+    cti_review.add_argument("--out", type=Path, required=True)
+
     cti_plan = subparsers.add_parser(
         "cti-plan-pivots", help="register Q0/Q1 plans without executing Censys"
     )
-    cti_plan.add_argument("--verified-manifest", type=Path, required=True)
+    cti_plan.add_argument("--accepted-assertions", type=Path, required=True)
+    cti_plan.add_argument("--cutoff-at", type=_datetime, required=True)
     cti_plan.add_argument("--db", type=Path, required=True)
     cti_plan.add_argument("--orbhunt", type=Path, required=True)
     cti_plan.add_argument("--template-config", type=Path, required=True)
@@ -389,6 +438,22 @@ def build_parser() -> argparse.ArgumentParser:
     cti_plan.add_argument("--version", required=True)
     cti_plan.add_argument("--config-hash", required=True)
     cti_plan.add_argument("--out", type=Path, required=True)
+    cti_export = subparsers.add_parser(
+        "cti-export-public-corpus", help="export validated public source metadata"
+    )
+    cti_export.add_argument("--db", type=Path, required=True)
+    cti_export.add_argument("--document-ids", type=Path, required=True)
+    cti_export.add_argument("--out", type=Path, required=True)
+    cti_audit = subparsers.add_parser(
+        "cti-audit-stage0", help="audit persisted Stage 0 provenance gates"
+    )
+    cti_audit.add_argument("--db", type=Path, required=True)
+    cti_audit.add_argument("--out", type=Path, required=True)
+    phase_a_audit = subparsers.add_parser(
+        "cti-audit-phase-a", help="audit Stage 0 and Stage 1 acceptance provenance"
+    )
+    phase_a_audit.add_argument("--db", type=Path, required=True)
+    phase_a_audit.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -473,7 +538,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "cti-verify-iocs":
         metadata = _load_snapshot_metadata(args.snapshot_metadata, args.document_id)
-        document = _document_from_snapshot_metadata(metadata, args.published_at)
+        document = _document_from_snapshot_metadata(
+            metadata, args.published_at, args.published_time_precision,
+            args.source_timezone,
+        )
         snapshot_bytes = _verified_snapshot_bytes(metadata)
         result = verify_indicator_candidates(
             _load_json(args.candidates), snapshot_bytes, document,
@@ -489,7 +557,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "cti-extract-iocs":
         metadata = _load_snapshot_metadata(args.snapshot_metadata, args.document_id)
-        document = _document_from_snapshot_metadata(metadata, args.published_at)
+        document = _document_from_snapshot_metadata(
+            metadata, args.published_at, args.published_time_precision,
+            args.source_timezone,
+        )
         snapshot_bytes = _verified_snapshot_bytes(metadata)
         extractor = AnthropicIndicatorExtractor(
             model=args.model,
@@ -512,7 +583,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "cti-register-indicators":
         metadata = _load_snapshot_metadata(args.snapshot_metadata, args.document_id)
-        document = _document_from_snapshot_metadata(metadata, args.published_at)
+        source_family_manifest = _load_json(args.source_family_manifest)
+        source_family = SourceFamilyRecord.model_validate(
+            source_family_manifest["source_family"]
+        )
+        source_relationships = [
+            SourceRelationshipRecord.model_validate(item)
+            for item in source_family_manifest.get("relationships", [])
+        ]
+        document = _document_from_snapshot_metadata(
+            metadata, args.published_at, args.published_time_precision,
+            args.source_timezone, source_family.source_family_id,
+        )
         verified = _load_json(args.verified_manifest)
         result = ExtractionResult(
             indicators=tuple(VerifiedIndicator(**item) for item in verified["indicators"]),
@@ -521,31 +603,65 @@ def main(argv: list[str] | None = None) -> int:
             source_mismatch_rejected=verified["source_mismatch_rejected"],
             future_time_rejected=verified["future_time_rejected"],
             duplicate_count=verified["duplicate_count"],
+            source_access_class=verified["source_access_class"],
+            source_acquisition_mode=verified["source_acquisition_mode"],
+            source_corpus_purpose=verified["source_corpus_purpose"],
             extraction_provenance=verified.get("extraction_provenance"),
         )
         secret = os.environ.get("ORB_PUBLIC_ID_HMAC_KEY")
         if not secret:
             raise RuntimeError("ORB_PUBLIC_ID_HMAC_KEY is required")
-        indicators, assertions = build_indicator_records(
+        indicators, mentions, assertions = build_indicator_records(
             result, document, ingested_at=args.ingested_at,
             public_id_hmac_key=secret.encode("utf-8"), campaign_id=args.campaign_id,
         )
-        database_effects = CorpusRegistry(args.db).register_indicator_bundle(
-            document=document, indicators=indicators, assertions=assertions,
+        registry = CorpusRegistry(args.db)
+        source_family_effects = registry.register_source_family(
+            source_family, source_relationships
+        )
+        database_effects = registry.register_indicator_bundle(
+            document=document, indicators=indicators, mentions=mentions,
+            assertions=assertions,
         )
         payload = {
             "document_id": document.document_id,
+            "source_family_id": source_family.source_family_id,
             "indicator_count": len(indicators),
             "assertion_count": len(assertions),
+            "source_mention_count": len(mentions),
             "public_indicator_ids": [record.public_id for record in indicators],
             "assertion_ids": [record.assertion_id for record in assertions],
+            "source_mention_ids": [record.mention_id for record in mentions],
         }
         write_immutable_json(args.out, payload)
-        print(json.dumps({**payload, "database_effects": database_effects}, ensure_ascii=False))
+        print(json.dumps({
+            **payload,
+            "source_family_effects": source_family_effects,
+            "database_effects": database_effects,
+        }, ensure_ascii=False))
+        return 0
+    if args.command == "cti-review-assertions":
+        raw_reviews = _load_json(args.reviews)
+        if not isinstance(raw_reviews, list):
+            raise ValueError("assertion reviews manifest must be a JSON array")
+        reviews = [AssertionReviewRecord.model_validate(item) for item in raw_reviews]
+        inserted = CorpusRegistry(args.db).register_assertion_reviews(reviews)
+        payload = {
+            "review_ids": [item.review_id for item in reviews],
+            "reviews_inserted": inserted,
+        }
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
         return 0
     if args.command == "cti-plan-pivots":
-        verified = _load_json(args.verified_manifest)
-        indicators = [VerifiedIndicator(**item) for item in verified["indicators"]]
+        accepted_manifest = _load_json(args.accepted_assertions)
+        if not isinstance(accepted_manifest, list) or not all(
+            isinstance(item, str) for item in accepted_manifest
+        ):
+            raise ValueError("accepted assertions manifest must be a JSON string array")
+        indicators = CorpusRegistry(args.db).accepted_pivot_sources(
+            accepted_manifest, cutoff_at=args.cutoff_at
+        )
         template_config = yaml.safe_load(args.template_config.read_text(encoding="utf-8")) or {}
         plans = register_pivot_plans(
             indicators,
@@ -553,12 +669,37 @@ def main(argv: list[str] | None = None) -> int:
             censys_adapter=OrbhuntCensysAdapter(args.orbhunt),
             q1_template_config=template_config,
             registered_at=args.registered_at,
+            cutoff_at=args.cutoff_at,
             query_version=args.version,
             config_hash=args.config_hash,
         )
         payload = [asdict(plan) for plan in plans]
         write_immutable_json(args.out, payload)
         print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "cti-export-public-corpus":
+        document_ids = _load_json(args.document_ids)
+        if not isinstance(document_ids, list) or not all(
+            isinstance(item, str) for item in document_ids
+        ):
+            raise ValueError("document IDs manifest must be a JSON string array")
+        payload = CorpusRegistry(args.db).public_source_manifest(document_ids)
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "cti-audit-stage0":
+        report = CorpusRegistry(args.db).stage0_gate_report()
+        write_immutable_json(args.out, report)
+        print(json.dumps(report, ensure_ascii=False))
+        if not report["passed"]:
+            raise RuntimeError("Stage 0 audit failed; inspect the report issues")
+        return 0
+    if args.command == "cti-audit-phase-a":
+        report = CorpusRegistry(args.db).phase_a_gate_report()
+        write_immutable_json(args.out, report)
+        print(json.dumps(report, ensure_ascii=False))
+        if not report["passed"]:
+            raise RuntimeError("Phase A audit failed; inspect the report issues")
         return 0
     if args.command == "normalize-censys":
         registry = QueryRegistry(args.db)
@@ -636,19 +777,31 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     registry = QueryRegistry(args.db)
     if args.command == "register-q0":
+        accepted = CorpusRegistry(args.db).accepted_pivot_sources(
+            [args.source_assertion_id], cutoff_at=args.cutoff_at
+        )[0]
+        if accepted.scope != "ip":
+            raise ValueError("register-q0 requires an accepted IP assertion")
         record = register_q0_seed(
             registry,
-            indicator_id=args.indicator_id,
-            ip_value=args.ip,
-            indicator_available_at=args.indicator_available_at,
+            indicator_id=accepted.indicator_id,
+            ip_value=accepted.value,
+            indicator_available_at=accepted.available_at,
+            source_assertion_id=args.source_assertion_id,
+            cutoff_at=args.cutoff_at,
             registered_at=args.registered_at,
             query_version=args.version,
             config_hash=args.config_hash,
         )
     elif args.command == "register-query":
+        query_class = QueryClass(args.query_class)
+        if query_class in {QueryClass.Q0_SEED, QueryClass.Q1_DIRECT_PIVOT}:
+            raise ValueError(
+                "Q0/Q1 registration requires the accepted assertion workflow"
+            )
         record = registry.register_query(
             query_version=args.version,
-            query_class=QueryClass(args.query_class),
+            query_class=query_class,
             query_text=args.query_text,
             developed_from_split=DatasetSplit(args.split),
             config_hash=args.config_hash,

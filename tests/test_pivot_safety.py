@@ -13,16 +13,17 @@ from pathlib import Path
 
 from src.adapters.orbhunt_censys import OrbhuntCensysAdapter
 from src.censys.query_registry import QueryRegistry
-from src.cti.ioc_extraction import VerifiedIndicator
 from src.cti.pivot_planning import register_pivot_plans
+from src.models import AcceptedPivotSource, AssertionRole
 
 
 class PivotSafetyTests(unittest.TestCase):
     def test_reference_domain_remains_blocked(self):
-        indicator = VerifiedIndicator(
-            "ioc-ref", "domain", "relay.example.org", "relay.example.org", "doc-1",
-            "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00",
-            "observed_in_report", "unknown", "evidence",
+        indicator = AcceptedPivotSource(
+            indicator_id="ioc-ref", assertion_id="assert-ref", review_id="review-ref",
+            scope="domain", value="relay.example.org", role=AssertionRole.RELAY_ORB,
+            available_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            source_confidence=0.9, extraction_confidence=0.9, role_confidence=0.9,
         )
         config = {
             "templates": {"domain": {
@@ -37,6 +38,7 @@ class PivotSafetyTests(unittest.TestCase):
                 censys_adapter=OrbhuntCensysAdapter(Path(r"D:\Gemini\ORB_Hunt_v5")),
                 q1_template_config=config,
                 registered_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+                cutoff_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
                 query_version="1", config_hash="cfg",
             )
             self.assertEqual("blocked", plans[0].status)

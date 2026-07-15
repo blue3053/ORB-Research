@@ -37,6 +37,12 @@ def valid_config():
             "classes": ["Q0_SEED"], "splits": ["development"],
         },
         "cti_search": {"domain_whitelist": ["Example.org", "example.org"]},
+        "cti_corpus": {
+            "require_source_family": True,
+            "require_source_access_class": True,
+            "public_export_allowed_access_classes": ["public"],
+            "development_excluded_acquisition_modes": ["prospective_validation"],
+        },
         "cti_ioc_extraction": {
             "model": "fixture-model",
             "prompt_path": "configs/2026-07-14-ioc-extract-v1.md",
@@ -52,6 +58,10 @@ class ConfigValidationTests(unittest.TestCase):
         config = ProjectConfig.model_validate(valid_config())
         self.assertEqual(["example.org"], config.cti_search.domain_whitelist)
         self.assertTrue(config.cti_ioc_extraction.require_raw_form_source_match)
+        self.assertEqual(
+            ["prospective_validation"],
+            config.cti_corpus.development_excluded_acquisition_modes,
+        )
         self.assertEqual(100, config.censys_collection.page_size)
 
     def test_rejects_unknown_and_unsafe_values(self):

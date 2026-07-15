@@ -42,6 +42,8 @@ def ensure_execution_allowed(
     cutoff = utc(cutoff_time)
     if cutoff > executed:
         raise ValueError("cutoff_time cannot be after executed_at")
+    if query.source_available_at and query.source_available_at > cutoff:
+        raise ValueError("query source is available after execution cutoff")
     if dataset_split is DatasetSplit.PROSPECTIVE_TEST:
         if query.status is not QueryStatus.FROZEN:
             raise ValueError("prospective-test requires a frozen query")
@@ -60,4 +62,3 @@ def query_supports_rq(query: QueryRecord, rq: str) -> bool:
         "RQ5": {"Q1_DIRECT_PIVOT", "Q2_DERIVED", "Q3_CLUSTER"},
     }
     return query.query_class.value in mapping.get(rq.upper(), set())
-

@@ -12,10 +12,14 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import re
 from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from src.models import SearchProtocolRecord
+from src.models import (
+    AcquisitionMode, CorpusPurpose, SearchProtocolRecord, SourceAccessClass,
+    TimePrecision, utc,
+)
 from src.provenance import canonical_json_hash, sha256_text
 
 
@@ -28,6 +32,43 @@ class SearchBackend(Protocol):
 
 
 @dataclass(frozen=True)
+class PublicationMetadata:
+    raw: str | None
+    exact_datetime: datetime | None
+    precision: TimePrecision
+    source_timezone: str
+
+
+def infer_publication_metadata(
+    value: Any, source_timezone: str | None = None
+) -> PublicationMetadata:
+    """게시일 문자열의 정밀도를 분류하되 비정밀 값을 timestamp로 승격하지 않는다."""
+
+    if value is None or not str(value).strip():
+        return PublicationMetadata(None, None, TimePrecision.UNKNOWN, "unknown")
+    raw = str(value).strip()
+    timezone_label = str(source_timezone or "unknown").strip() or "unknown"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return PublicationMetadata(raw, None, TimePrecision.DATE, timezone_label)
+    if re.fullmatch(r"\d{4}-\d{2}", raw):
+        return PublicationMetadata(raw, None, TimePrecision.MONTH, timezone_label)
+    if re.fullmatch(r"\d{4}", raw):
+        return PublicationMetadata(raw, None, TimePrecision.YEAR, timezone_label)
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return PublicationMetadata(raw, None, TimePrecision.UNKNOWN, timezone_label)
+    if parsed.tzinfo is None:
+        return PublicationMetadata(raw, None, TimePrecision.UNKNOWN, timezone_label)
+    exact = utc(parsed)
+    if timezone_label == "unknown":
+        timezone_label = "UTC" if raw.endswith("Z") else parsed.strftime("%z") or "unknown"
+    return PublicationMetadata(
+        raw, exact, TimePrecision.EXACT_TIMESTAMP, timezone_label
+    )
+
+
+@dataclass(frozen=True)
 class SearchCandidate:
     candidate_id: str
     query_text: str
@@ -36,8 +77,14 @@ class SearchCandidate:
     publisher: str
     published_at: str | None
     published_at_basis: str
+    published_time_precision: str
+    source_timezone: str
     rank: int
     discovered_at: str
+    search_protocol_id: str
+    source_access_class: str
+    acquisition_mode: str
+    corpus_purpose: str
 
 
 @dataclass(frozen=True)
@@ -99,6 +146,9 @@ def execute_search_protocol(
                 continue
             seen.add(url)
             published = raw.get("published_at") or raw.get("published_date")
+            publication = infer_publication_metadata(
+                published, raw.get("source_timezone")
+            )
             publisher = (urlsplit(url).hostname or "unknown").lower()
             candidate_id = f"cti-candidate-{sha256_text(url)[:16]}"
             candidates.append(SearchCandidate(
@@ -107,10 +157,20 @@ def execute_search_protocol(
                 title=str(raw.get("title") or url),
                 url=url,
                 publisher=publisher,
-                published_at=str(published) if published else None,
+                published_at=publication.raw,
                 published_at_basis="search_provider" if published else "unknown",
+                published_time_precision=publication.precision.value,
+                source_timezone=publication.source_timezone,
                 rank=rank,
                 discovered_at=executed.isoformat(),
+                search_protocol_id=protocol.search_protocol_id,
+                source_access_class=protocol.source_access_class.value,
+                acquisition_mode=protocol.acquisition_mode.value,
+                corpus_purpose=(
+                    CorpusPurpose.PROSPECTIVE_VALIDATION.value
+                    if protocol.acquisition_mode is AcquisitionMode.PROSPECTIVE_VALIDATION
+                    else CorpusPurpose.DEVELOPMENT.value
+                ),
             ))
     payload = [asdict(candidate) for candidate in candidates]
     manifest_hash = canonical_json_hash(payload)

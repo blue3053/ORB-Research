@@ -13,14 +13,16 @@ from pathlib import Path
 
 from src.adapters.orbhunt_censys import OrbhuntCensysAdapter
 from src.censys.query_registry import QueryRegistry
-from src.cti.ioc_extraction import VerifiedIndicator
 from src.cti.pivot_planning import register_pivot_plans
+from src.models import AcceptedPivotSource, AssertionRole
 
 
-def indicator(identifier, scope, value, context="malicious"):
-    return VerifiedIndicator(
-        identifier, scope, value, value, "doc-1", "2026-01-01T00:00:00+00:00",
-        "2026-01-02T00:00:00+00:00", "observed_in_report", context, "evidence",
+def indicator(identifier, scope, value, role=AssertionRole.RELAY_ORB):
+    return AcceptedPivotSource(
+        indicator_id=identifier, assertion_id=f"assert-{identifier}",
+        review_id=f"review-{identifier}", scope=scope, value=value, role=role,
+        available_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        source_confidence=0.9, extraction_confidence=0.9, role_confidence=0.9,
     )
 
 
@@ -48,6 +50,7 @@ class PivotPlanningTests(unittest.TestCase):
                 censys_adapter=OrbhuntCensysAdapter(Path(r"D:\Gemini\ORB_Hunt_v5")),
                 q1_template_config=config,
                 registered_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+                cutoff_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
                 query_version="1", config_hash="cfg",
             )
             self.assertEqual("Q0_SEED", plans[0].query_class)
@@ -78,20 +81,21 @@ class PivotPlanningTests(unittest.TestCase):
                 [
                     indicator(
                         "ioc-legitimate", "domain", "c.speedtest.net",
-                        context="legitimate_infra",
+                        role=AssertionRole.UNKNOWN,
                     ),
                     indicator("ioc-private", "ip", "192.168.18.111"),
-                    indicator("ioc-relay", "domain", "relay.badinfra.net", "relay_node"),
+                    indicator("ioc-relay", "domain", "relay.badinfra.net"),
                 ],
                 registry=registry,
                 censys_adapter=OrbhuntCensysAdapter(Path(r"D:\Gemini\ORB_Hunt_v5")),
                 q1_template_config=config,
                 registered_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+                cutoff_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
                 query_version="1",
                 config_hash="cfg",
             )
             self.assertEqual("blocked", plans[0].status)
-            self.assertIn("context", plans[0].reason)
+            self.assertIn("role", plans[0].reason)
             self.assertEqual("blocked", plans[1].status)
             self.assertIn("globally routable", plans[1].reason)
             self.assertEqual("registered_not_executed", plans[2].status)

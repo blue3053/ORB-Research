@@ -49,6 +49,12 @@ cti_search:
     - security.googleblog.com
     - unit42.paloaltonetworks.com
 
+cti_corpus:
+  require_source_family: true
+  require_source_access_class: true
+  public_export_allowed_access_classes: [public]
+  development_excluded_acquisition_modes: [prospective_validation]
+
 cti_ioc_extraction:
   backend: anthropic-structured-tool
   model: claude-sonnet-4-6

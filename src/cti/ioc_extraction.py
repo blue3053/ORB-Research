@@ -19,6 +19,7 @@ from io import BytesIO
 import ipaddress
 import os
 from pathlib import Path
+import re
 from typing import Any, Protocol
 
 from src.adapters.cti_agent import CtiAgentAdapter
@@ -32,10 +33,19 @@ from src.models import (
     IndicatorType,
     ReviewerStatus,
     SourceDocumentRecord,
+    SourceMentionRecord,
     utc,
 )
 from src.provenance import sha256_text
 from src.reused.cti_agent.ioc_regex import CONTEXTS, SCOPES
+
+
+STAGE1_SCOPES = tuple(dict.fromkeys(
+    (*SCOPES, "spki", "ssh_key", "ja4", "port_protocol", "http_device_hint")
+))
+STAGE1_CONTEXTS = tuple(dict.fromkeys(
+    (*CONTEXTS, "controller", "staging", "c2", "scanner", "sinkhole")
+))
 
 
 EXTRACT_SCHEMA = {
@@ -53,8 +63,8 @@ EXTRACT_SCHEMA = {
                 ],
                 "properties": {
                     "raw_form": {"type": "string", "minLength": 3},
-                    "scope": {"enum": list(SCOPES)},
-                    "context": {"enum": list(CONTEXTS)},
+                    "scope": {"enum": list(STAGE1_SCOPES)},
+                    "context": {"enum": list(STAGE1_CONTEXTS)},
                     "context_evidence": {"type": "string"},
                     "observed_at": {"type": ["string", "null"]},
                 },
@@ -306,11 +316,36 @@ class ExtractionResult:
     source_mismatch_rejected: int
     future_time_rejected: int
     duplicate_count: int
+    source_access_class: str
+    source_acquisition_mode: str
+    source_corpus_purpose: str
     extraction_provenance: dict[str, Any] | None = None
 
 
-def _parse_observed(value: Any, fallback: datetime) -> tuple[datetime, str]:
+def ensure_development_source_manifest(manifest: dict[str, Any]) -> None:
+    """Fail closed before development pivots can consume prospective evidence."""
+
+    required = (
+        "source_access_class",
+        "source_acquisition_mode",
+        "source_corpus_purpose",
+    )
+    missing = [name for name in required if not manifest.get(name)]
+    if missing:
+        raise ValueError("verified manifest lacks source provenance: " + ", ".join(missing))
+    if (
+        manifest["source_acquisition_mode"] == "prospective_validation"
+        or manifest["source_corpus_purpose"] == "prospective_validation"
+    ):
+        raise ValueError("prospective validation evidence cannot feed development pivots")
+
+
+def _parse_observed(value: Any, fallback: datetime | None) -> tuple[datetime, str]:
     if not value:
+        if fallback is None:
+            raise ValueError(
+                "observed_at cannot fall back to a non-exact publication date"
+            )
         return fallback, "publication_date_fallback"
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -337,11 +372,11 @@ def verify_indicator_candidates(
     for candidate in candidates:
         scope = str(candidate.get("scope", ""))
         raw_form = str(candidate.get("raw_form", ""))
-        if str(candidate.get("context", "unknown")) not in CONTEXTS:
+        if str(candidate.get("context", "unknown")) not in STAGE1_CONTEXTS:
             format_rejected += 1
             continue
         try:
-            value = adapter.normalize_indicator(scope, raw_form)
+            value = _normalize_stage1_indicator(adapter, scope, raw_form)
         except (KeyError, TypeError, ValueError):
             format_rejected += 1
             continue
@@ -364,7 +399,7 @@ def verify_indicator_candidates(
             duplicates += 1
             continue
         seen.add(key)
-        material = f"{document.document_id}|{scope}|{value}"
+        material = f"{scope}|{value}"
         verified.append(VerifiedIndicator(
             indicator_id=f"ioc-{sha256_text(material)[:20]}",
             scope=scope,
@@ -384,6 +419,9 @@ def verify_indicator_candidates(
         source_mismatch_rejected=mismatch,
         future_time_rejected=future,
         duplicate_count=duplicates,
+        source_access_class=document.source_access_class.value,
+        source_acquisition_mode=document.acquisition_mode.value,
+        source_corpus_purpose=document.corpus_purpose.value,
     )
 
 
@@ -437,6 +475,31 @@ def _indicator_type(scope: str, value: str) -> IndicatorType:
     }.get(scope, IndicatorType.OTHER)
 
 
+def _normalize_stage1_indicator(
+    adapter: CtiAgentAdapter, scope: str, raw_form: str
+) -> str:
+    if scope in SCOPES:
+        return adapter.normalize_indicator(scope, raw_form)
+    value = raw_form.strip()
+    if scope == "spki" and re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        return value.lower()
+    if scope == "ssh_key" and re.fullmatch(
+        r"ssh-(?:rsa|ed25519) [A-Za-z0-9+/=]{20,}", value
+    ):
+        return value
+    if scope == "ja4" and re.fullmatch(r"[a-z0-9_]{10,128}", value.lower()):
+        return value.lower()
+    if scope == "port_protocol" and re.fullmatch(
+        r"(?:tcp|udp)/(?:[1-9]\d{0,4})|(?:[1-9]\d{0,4})/(?:tcp|udp)", value.lower()
+    ):
+        port = int(re.search(r"\d+", value).group())
+        if port <= 65535:
+            return value.lower()
+    if scope == "http_device_hint" and 1 <= len(value) <= 256 and "\n" not in value:
+        return value
+    raise ValueError(f"unsupported or invalid Stage 1 indicator: {scope}")
+
+
 def build_indicator_records(
     result: ExtractionResult,
     document: SourceDocumentRecord,
@@ -444,14 +507,23 @@ def build_indicator_records(
     ingested_at: datetime,
     public_id_hmac_key: bytes,
     campaign_id: str | None = None,
-) -> tuple[list[IndicatorRecord], list[IndicatorAssertionRecord]]:
+) -> tuple[
+    list[IndicatorRecord], list[SourceMentionRecord], list[IndicatorAssertionRecord]
+]:
     """검증 결과를 제한 indicator와 출처별 보수적 assertion 레코드로 변환한다."""
 
     if len(public_id_hmac_key) < 32:
         raise ValueError("ORB_PUBLIC_ID_HMAC_KEY must be at least 32 bytes")
+    if document.published_at is None:
+        raise ValueError(
+            "exact publication timestamp is required by the current assertion schema"
+        )
+    if not document.source_family_id:
+        raise ValueError("source family is required for source mention creation")
     ingested = utc(ingested_at)
     indicators: list[IndicatorRecord] = []
     assertions: list[IndicatorAssertionRecord] = []
+    mentions: list[SourceMentionRecord] = []
     for item in result.indicators:
         material = f"{item.scope}|{item.value}".encode("utf-8")
         public_digest = hmac.new(public_id_hmac_key, material, hashlib.sha256).hexdigest()
@@ -469,24 +541,52 @@ def build_indicator_records(
             sensitivity=sensitivity,
         ))
         role = {
-            "relay_node": AssertionRole.MIDDLE,
+            "relay_node": AssertionRole.RELAY_ORB,
+            "controller": AssertionRole.CONTROLLER,
+            "staging": AssertionRole.STAGING,
+            "c2": AssertionRole.C2,
+            "scanner": AssertionRole.SCANNER,
             "victim": AssertionRole.VICTIM,
+            "sinkhole": AssertionRole.SINKHOLE,
         }.get(item.context, AssertionRole.UNKNOWN)
+        observed_at = datetime.fromisoformat(item.observed_at)
+        available_at = datetime.fromisoformat(item.available_at)
+        raw_form_hash = sha256_text(item.raw_form)
         evidence_hash = sha256_text(item.context_evidence)
+        mention_material = (
+            f"{document.document_id}|{item.indicator_id}|{raw_form_hash}|{evidence_hash}"
+        )
+        mention_id = f"mention-{sha256_text(mention_material)[:20]}"
+        mentions.append(SourceMentionRecord(
+            mention_id=mention_id,
+            indicator_id=item.indicator_id,
+            document_id=document.document_id,
+            source_family_id=document.source_family_id,
+            scope=item.scope,
+            raw_form_hash=raw_form_hash,
+            context_excerpt_hash=evidence_hash,
+            observed_at=observed_at,
+            available_at=available_at,
+        ))
         assertion_material = (
-            f"{document.document_id}|{item.indicator_id}|{role.value}|{evidence_hash}"
+            f"{mention_id}|{role.value}|{evidence_hash}"
         )
         assertions.append(IndicatorAssertionRecord(
             assertion_id=f"assert-{sha256_text(assertion_material)[:20]}",
             indicator_id=item.indicator_id,
             document_id=document.document_id,
+            source_mention_id=mention_id,
             campaign_id=campaign_id,
             role=role,
             verdict=AssertionVerdict.CANDIDATE,
             evidence_type=EvidenceType.CLAIM,
-            vendor_first_seen=datetime.fromisoformat(item.observed_at),
+            vendor_first_seen=observed_at,
             first_public_at=document.published_at,
+            available_at=available_at,
+            source_confidence=None,
+            extraction_confidence=None,
+            role_confidence=None,
             context_excerpt_hash=evidence_hash,
             reviewer_status=ReviewerStatus.PENDING,
         ))
-    return indicators, assertions
+    return indicators, mentions, assertions

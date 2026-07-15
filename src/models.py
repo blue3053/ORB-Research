@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
+import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class AcquisitionMode(StrEnum):
@@ -22,6 +23,34 @@ class AcquisitionMode(StrEnum):
     SYSTEMATIC_PUBLIC = "systematic_public"
     COMMERCIAL = "commercial"
     PROSPECTIVE_VALIDATION = "prospective_validation"
+
+
+class SourceAccessClass(StrEnum):
+    PUBLIC = "public"
+    RESTRICTED = "restricted"
+
+
+class CorpusPurpose(StrEnum):
+    DEVELOPMENT = "development"
+    PROSPECTIVE_VALIDATION = "prospective_validation"
+
+
+class TimePrecision(StrEnum):
+    EXACT_TIMESTAMP = "exact_timestamp"
+    DATE = "date"
+    DAY = "day"
+    MONTH = "month"
+    YEAR = "year"
+    RANGE = "range"
+    UNKNOWN = "unknown"
+
+
+class SourceRelationshipType(StrEnum):
+    ORIGINAL = "original"
+    REPUBLISH = "republish"
+    TRANSLATION = "translation"
+    SUMMARY = "summary"
+    FOLLOW_UP = "follow_up"
 
 
 class QueryClass(StrEnum):
@@ -69,6 +98,7 @@ class IndicatorSensitivity(StrEnum):
 
 
 class AssertionRole(StrEnum):
+    RELAY_ORB = "relay_orb"
     EXIT = "exit"
     MIDDLE = "middle"
     CONTROLLER = "controller"
@@ -76,6 +106,7 @@ class AssertionRole(StrEnum):
     C2 = "c2"
     SCANNER = "scanner"
     VICTIM = "victim"
+    SINKHOLE = "sinkhole"
     UNKNOWN = "unknown"
 
 
@@ -166,6 +197,9 @@ class StrictUTCModel(BaseModel):
 class SearchProtocolRecord(StrictUTCModel):
     search_protocol_id: str
     protocol_version: str
+    research_cutoff_at: datetime
+    source_access_class: SourceAccessClass
+    acquisition_mode: AcquisitionMode
     target_date_from: str
     target_date_to: str
     target_publishers: list[str]
@@ -176,7 +210,29 @@ class SearchProtocolRecord(StrictUTCModel):
     registered_at: datetime
     protocol_hash: str
 
+    _research_cutoff_at_utc = field_validator("research_cutoff_at")(utc)
     _registered_at_utc = field_validator("registered_at")(utc)
+
+
+class SourceFamilyRecord(StrictUTCModel):
+    source_family_id: str
+    canonical_document_id: str
+    reviewer_id: str
+    reviewed_at: datetime
+
+    _reviewed_at_utc = field_validator("reviewed_at")(utc)
+
+
+class SourceRelationshipRecord(StrictUTCModel):
+    relationship_id: str
+    source_family_id: str
+    document_id: str
+    related_document_id: str
+    relationship_type: SourceRelationshipType
+    reviewer_id: str
+    reviewed_at: datetime
+
+    _reviewed_at_utc = field_validator("reviewed_at")(utc)
 
 
 class SourceDocumentRecord(StrictUTCModel):
@@ -184,16 +240,62 @@ class SourceDocumentRecord(StrictUTCModel):
     canonical_url: str
     publisher: str
     title: str
-    published_at: datetime
+    published_at: datetime | None
+    published_at_raw: str
+    published_time_precision: TimePrecision
+    source_timezone: str
     retrieved_at: datetime
     content_sha256: str
+    text_content_sha256: str | None = None
     acquisition_mode: AcquisitionMode
+    source_access_class: SourceAccessClass
+    corpus_purpose: CorpusPurpose
     search_protocol_id: str | None = None
     discovery_query_id: str | None = None
     source_independence: str = "unknown"
+    source_family_id: str | None = None
 
-    _published_at_utc = field_validator("published_at")(utc)
+    _published_at_utc = field_validator("published_at")(
+        lambda value: None if value is None else utc(value)
+    )
     _retrieved_at_utc = field_validator("retrieved_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_publication_time(self) -> "SourceDocumentRecord":
+        for name in ("document_id", "canonical_url", "publisher", "title"):
+            if not str(getattr(self, name)).strip():
+                raise ValueError(f"{name} must be nonempty")
+        for name in ("content_sha256", "text_content_sha256"):
+            value = getattr(self, name)
+            if value is not None and not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"{name} must be a lowercase SHA-256 hex digest")
+        if not self.published_at_raw.strip():
+            raise ValueError("published_at_raw must be nonempty")
+        if not self.source_timezone.strip():
+            raise ValueError("source_timezone must be nonempty")
+        is_exact = self.published_time_precision is TimePrecision.EXACT_TIMESTAMP
+        if is_exact != (self.published_at is not None):
+            raise ValueError(
+                "published_at is allowed exactly when precision is exact_timestamp"
+            )
+        if self.published_at is not None and self.published_at > self.retrieved_at:
+            raise ValueError("published_at must not be after retrieved_at")
+        if (
+            self.acquisition_mode is AcquisitionMode.SYSTEMATIC_PUBLIC
+            and self.source_access_class is not SourceAccessClass.PUBLIC
+        ):
+            raise ValueError("systematic_public acquisition requires public access")
+        if (
+            self.acquisition_mode is AcquisitionMode.COMMERCIAL
+            and self.source_access_class is not SourceAccessClass.RESTRICTED
+        ):
+            raise ValueError("commercial acquisition requires restricted access")
+        prospective = self.acquisition_mode is AcquisitionMode.PROSPECTIVE_VALIDATION
+        if prospective != (self.corpus_purpose is CorpusPurpose.PROSPECTIVE_VALIDATION):
+            raise ValueError(
+                "prospective_validation acquisition and corpus purpose must match"
+            )
+        return self
 
 
 class IndicatorRecord(StrictUTCModel):
@@ -207,10 +309,37 @@ class IndicatorRecord(StrictUTCModel):
     _first_ingested_at_utc = field_validator("first_ingested_at")(utc)
 
 
+class SourceMentionRecord(StrictUTCModel):
+    mention_id: str
+    indicator_id: str
+    document_id: str
+    source_family_id: str
+    scope: str
+    raw_form_hash: str
+    context_excerpt_hash: str
+    observed_at: datetime
+    available_at: datetime
+
+    _observed_at_utc = field_validator("observed_at")(utc)
+    _available_at_utc = field_validator("available_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_hashes_and_time(self) -> "SourceMentionRecord":
+        for name in ("raw_form_hash", "context_excerpt_hash"):
+            if not re.fullmatch(r"[0-9a-f]{64}", getattr(self, name)):
+                raise ValueError(f"{name} must be a lowercase SHA-256 hex digest")
+        if not self.scope.strip():
+            raise ValueError("source mention scope is required")
+        if self.observed_at > self.available_at:
+            raise ValueError("source mention observed_at cannot exceed available_at")
+        return self
+
+
 class IndicatorAssertionRecord(StrictUTCModel):
     assertion_id: str
     indicator_id: str
     document_id: str
+    source_mention_id: str
     campaign_id: str | None = None
     role: AssertionRole = AssertionRole.UNKNOWN
     verdict: AssertionVerdict = AssertionVerdict.CANDIDATE
@@ -218,7 +347,10 @@ class IndicatorAssertionRecord(StrictUTCModel):
     vendor_first_seen: datetime | None = None
     vendor_last_seen: datetime | None = None
     first_public_at: datetime
-    confidence: float | None = Field(default=None, ge=0, le=1)
+    available_at: datetime
+    source_confidence: float | None = Field(default=None, ge=0, le=1)
+    extraction_confidence: float | None = Field(default=None, ge=0, le=1)
+    role_confidence: float | None = Field(default=None, ge=0, le=1)
     context_excerpt_hash: str
     reviewer_status: ReviewerStatus = ReviewerStatus.PENDING
 
@@ -229,6 +361,47 @@ class IndicatorAssertionRecord(StrictUTCModel):
         lambda value: None if value is None else utc(value)
     )
     _first_public_at_utc = field_validator("first_public_at")(utc)
+    _available_at_utc = field_validator("available_at")(utc)
+
+
+class AssertionReviewRecord(StrictUTCModel):
+    review_id: str
+    assertion_id: str
+    decision: ReviewerStatus
+    reviewer_id: str
+    reviewed_at: datetime
+    reviewed_role: AssertionRole
+    source_confidence: float = Field(ge=0, le=1)
+    extraction_confidence: float = Field(ge=0, le=1)
+    role_confidence: float = Field(ge=0, le=1)
+    notes_hash: str
+
+    _reviewed_at_utc = field_validator("reviewed_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_review(self) -> "AssertionReviewRecord":
+        if self.decision is ReviewerStatus.PENDING:
+            raise ValueError("persisted assertion review must be accepted or rejected")
+        if not self.reviewer_id.strip():
+            raise ValueError("assertion reviewer_id is required")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.notes_hash):
+            raise ValueError("notes_hash must be a lowercase SHA-256 hex digest")
+        return self
+
+
+class AcceptedPivotSource(StrictUTCModel):
+    indicator_id: str
+    assertion_id: str
+    review_id: str
+    scope: str
+    value: str
+    role: AssertionRole
+    available_at: datetime
+    source_confidence: float = Field(ge=0, le=1)
+    extraction_confidence: float = Field(ge=0, le=1)
+    role_confidence: float = Field(ge=0, le=1)
+
+    _available_at_utc = field_validator("available_at")(utc)
 
 
 class HostObservationRecord(StrictUTCModel):
@@ -307,6 +480,8 @@ class QueryRecord(StrictUTCModel):
     query_text: str
     query_hash: str
     source_indicator_ids: list[str] = Field(default_factory=list)
+    source_assertion_ids: list[str] = Field(default_factory=list)
+    source_available_at: datetime | None = None
     source_feature_ids: list[str] = Field(default_factory=list)
     developed_from_split: DatasetSplit
     registered_at: datetime
@@ -316,8 +491,19 @@ class QueryRecord(StrictUTCModel):
     status: QueryStatus = QueryStatus.DRAFT
 
     _registered_at_utc = field_validator("registered_at")(utc)
+    _source_available_at_utc = field_validator("source_available_at")(
+        lambda v: None if v is None else utc(v)
+    )
     _frozen_at_utc = field_validator("frozen_at")(lambda v: None if v is None else utc(v))
     _valid_from_utc = field_validator("valid_for_test_from")(lambda v: None if v is None else utc(v))
+
+    @model_validator(mode="after")
+    def _validate_source_provenance_time(self) -> "QueryRecord":
+        if self.source_assertion_ids and not self.source_indicator_ids:
+            raise ValueError("source assertions require source indicators")
+        if self.source_available_at and self.source_available_at > self.registered_at:
+            raise ValueError("query cannot predate source availability")
+        return self
 
 
 class QueryExecutionRecord(StrictUTCModel):

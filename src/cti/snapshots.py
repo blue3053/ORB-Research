@@ -21,10 +21,17 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.cti.search_execution import SearchCandidate, host_allowed
+from src.cti.search_execution import (
+    SearchCandidate,
+    host_allowed,
+    infer_publication_metadata,
+)
 from src.manifests import write_immutable_json
 from src.provenance import sha256_file, sha256_text
-from src.models import AcquisitionMode, SourceDocumentRecord
+from src.models import (
+    AcquisitionMode, CorpusPurpose, SourceAccessClass, SourceDocumentRecord,
+    TimePrecision,
+)
 from src.cti.corpus_registry import CorpusRegistry
 
 
@@ -45,11 +52,17 @@ class SnapshotRecord:
     title: str
     published_at: str | None
     published_at_basis: str
+    published_time_precision: str
+    source_timezone: str
     retrieved_at: str
     content_type: str
     content_sha256: str
     snapshot_path: str
     metadata_path: str
+    search_protocol_id: str
+    source_access_class: str
+    acquisition_mode: str
+    corpus_purpose: str
 
 
 class PassiveDocumentFetcher:
@@ -130,11 +143,17 @@ class ImmutableSnapshotStore:
             title=candidate.title,
             published_at=candidate.published_at,
             published_at_basis=candidate.published_at_basis,
+            published_time_precision=candidate.published_time_precision,
+            source_timezone=candidate.source_timezone,
             retrieved_at=retrieved.isoformat(),
             content_type=fetched.content_type,
             content_sha256=sha256_file(snapshot_path),
             snapshot_path=str(snapshot_path),
             metadata_path=str(metadata_path),
+            search_protocol_id=candidate.search_protocol_id,
+            source_access_class=candidate.source_access_class,
+            acquisition_mode=candidate.acquisition_mode,
+            corpus_purpose=candidate.corpus_purpose,
         )
         write_immutable_json(metadata_path, asdict(record))
         return record
@@ -177,18 +196,42 @@ def import_existing_cti(
                 raise ValueError(f"OCR text_file is missing or escapes source_root: {entry['text_file']}")
             text_hash = sha256_file(text_path)
         document_id = f"cti-doc-{sha256_text(relative + '|' + content_hash)[:20]}"
-        published = datetime.fromisoformat(str(entry["published_at"]).replace("Z", "+00:00"))
-        if published.tzinfo is None:
-            raise ValueError(f"published_at must include timezone: {relative}")
+        if "published_time_precision" not in entry or "source_timezone" not in entry:
+            raise ValueError(
+                f"published_time_precision and source_timezone are required: {relative}"
+            )
+        if "source_access_class" not in entry or "corpus_purpose" not in entry:
+            raise ValueError(
+                f"source_access_class and corpus_purpose are required: {relative}"
+            )
+        published_raw = str(entry["published_at"])
+        precision = TimePrecision(str(entry["published_time_precision"]))
+        source_timezone = str(entry["source_timezone"]).strip()
+        publication = infer_publication_metadata(published_raw, source_timezone)
+        if precision in {
+            TimePrecision.EXACT_TIMESTAMP,
+            TimePrecision.DATE,
+            TimePrecision.MONTH,
+            TimePrecision.YEAR,
+        } and publication.precision is not precision:
+            raise ValueError(
+                f"published_at does not match published_time_precision: {relative}"
+            )
         document = SourceDocumentRecord(
             document_id=document_id,
             canonical_url=str(entry.get("source_url") or f"local://existing_curated/{relative}"),
             publisher=str(entry["publisher"]),
             title=str(entry.get("title") or source_path.stem),
-            published_at=published,
+            published_at=publication.exact_datetime,
+            published_at_raw=published_raw,
+            published_time_precision=precision,
+            source_timezone=source_timezone,
             retrieved_at=imported,
             content_sha256=content_hash,
+            text_content_sha256=text_hash,
             acquisition_mode=AcquisitionMode.EXISTING_CURATED,
+            source_access_class=SourceAccessClass(str(entry["source_access_class"])),
+            corpus_purpose=CorpusPurpose(str(entry["corpus_purpose"])),
             source_independence=str(entry.get("source_independence", "unknown")),
         )
         inserted = registry.register_document(document)
@@ -197,7 +240,9 @@ def import_existing_cti(
             "final_url": document.canonical_url,
             "publisher": document.publisher,
             "title": document.title,
-            "published_at": document.published_at.isoformat(),
+            "published_at": document.published_at_raw,
+            "published_time_precision": document.published_time_precision.value,
+            "source_timezone": document.source_timezone,
             "retrieved_at": document.retrieved_at.isoformat(),
             "content_sha256": content_hash,
             "snapshot_path": str(source_path),
@@ -205,6 +250,8 @@ def import_existing_cti(
             "text_snapshot_path": str(text_path) if text_path else None,
             "text_content_sha256": text_hash,
             "acquisition_mode": AcquisitionMode.EXISTING_CURATED.value,
+            "source_access_class": document.source_access_class.value,
+            "corpus_purpose": document.corpus_purpose.value,
             "source_independence": document.source_independence,
             "original_filename": relative,
             "registered": inserted,

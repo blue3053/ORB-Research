@@ -23,12 +23,15 @@ class Q0SeedTests(unittest.TestCase):
             record = register_q0_seed(
                 registry, indicator_id="ioc-1", ip_value="192.0.2.7",
                 indicator_available_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                source_assertion_id="assert-1",
+                cutoff_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
                 registered_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
                 query_version="1", config_hash="cfg",
             )
             self.assertEqual(QueryClass.Q0_SEED, record.query_class)
             self.assertEqual("host.ip = 192.0.2.7", record.query_text)
             self.assertEqual(["ioc-1"], record.source_indicator_ids)
+            self.assertEqual(["assert-1"], record.source_assertion_ids)
 
     def test_rejects_non_ip_and_future_source(self):
         with self.assertRaises(ValueError):
@@ -38,6 +41,8 @@ class Q0SeedTests(unittest.TestCase):
                 QueryRegistry(Path(directory) / "registry.sqlite"), indicator_id="ioc-1",
                 ip_value="192.0.2.7",
                 indicator_available_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
+                source_assertion_id="assert-1",
+                cutoff_at=datetime(2026, 1, 3, tzinfo=timezone.utc),
                 registered_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
                 query_version="1", config_hash="cfg",
             )

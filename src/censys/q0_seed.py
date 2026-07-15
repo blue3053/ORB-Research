@@ -30,12 +30,19 @@ def register_q0_seed(
     indicator_id: str,
     ip_value: str,
     indicator_available_at: datetime,
+    source_assertion_id: str,
+    cutoff_at: datetime,
     registered_at: datetime,
     query_version: str,
     config_hash: str,
 ) -> QueryRecord:
     available = utc(indicator_available_at)
     registered = utc(registered_at)
+    cutoff = utc(cutoff_at)
+    if not source_assertion_id.strip():
+        raise ValueError("Q0 source_assertion_id is required")
+    if available > cutoff:
+        raise ValueError("Q0 source assertion is available after cutoff")
     if registered < available:
         raise ValueError("Q0 query cannot be registered before its source indicator is available")
     return registry.register_query(
@@ -45,5 +52,7 @@ def register_q0_seed(
         developed_from_split=DatasetSplit.DEVELOPMENT,
         config_hash=config_hash,
         source_indicator_ids=[indicator_id],
+        source_assertion_ids=[source_assertion_id],
+        source_available_at=available,
         registered_at=registered,
     )

@@ -18,12 +18,24 @@ from typing import Any
 from src.adapters.orbhunt_censys import OrbhuntCensysAdapter
 from src.censys.q0_seed import register_q0_seed
 from src.censys.query_registry import QueryRegistry
-from src.cti.ioc_extraction import VerifiedIndicator
-from src.models import DatasetSplit, QueryClass
+from src.models import AcceptedPivotSource, AssertionRole, DatasetSplit, QueryClass, utc
 
 
-Q1_SCOPE_MAP = {"cert": "cert_sha256", "jarm": "jarm", "domain": "domain"}
-PIVOTABLE_CONTEXTS = {"malicious", "relay_node"}
+Q1_SCOPE_MAP = {
+    "cert": "cert_sha256",
+    "spki": "spki",
+    "ssh_key": "ssh_key",
+    "jarm": "jarm",
+    "ja4": "ja4",
+    "domain": "domain",
+}
+PIVOTABLE_ROLES = {
+    AssertionRole.RELAY_ORB,
+    AssertionRole.CONTROLLER,
+    AssertionRole.STAGING,
+    AssertionRole.C2,
+    AssertionRole.SCANNER,
+}
 
 
 @dataclass(frozen=True)
@@ -38,24 +50,35 @@ class PivotPlan:
 
 
 def register_pivot_plans(
-    indicators: list[VerifiedIndicator],
+    indicators: list[AcceptedPivotSource],
     *,
     registry: QueryRegistry,
     censys_adapter: OrbhuntCensysAdapter,
     q1_template_config: dict[str, Any],
     registered_at: datetime,
+    cutoff_at: datetime,
     query_version: str,
     config_hash: str,
 ) -> tuple[PivotPlan, ...]:
     """지원 indicator를 Q0/Q1 query로 등록하고 network 미실행 계획을 반환한다."""
 
     plans: list[PivotPlan] = []
+    cutoff = utc(cutoff_at)
+    registered = utc(registered_at)
     for indicator in indicators:
-        available_at = datetime.fromisoformat(indicator.available_at)
-        if indicator.context not in PIVOTABLE_CONTEXTS:
+        available_at = indicator.available_at
+        if available_at > cutoff:
             plans.append(PivotPlan(
                 indicator.indicator_id, indicator.scope, None, None, None,
-                "blocked", f"context is not pivotable: {indicator.context}",
+                "blocked", "accepted assertion is available after cutoff",
+            ))
+            continue
+        if registered < available_at:
+            raise ValueError("query cannot be registered before accepted assertion availability")
+        if indicator.role not in PIVOTABLE_ROLES:
+            plans.append(PivotPlan(
+                indicator.indicator_id, indicator.scope, None, None, None,
+                "blocked", f"accepted assertion role is not pivotable: {indicator.role.value}",
             ))
             continue
         if indicator.scope == "ip":
@@ -78,6 +101,8 @@ def register_pivot_plans(
                 indicator_id=indicator.indicator_id,
                 ip_value=indicator.value,
                 indicator_available_at=available_at,
+                source_assertion_id=indicator.assertion_id,
+                cutoff_at=cutoff,
                 registered_at=registered_at,
                 query_version=query_version,
                 config_hash=config_hash,
@@ -111,6 +136,8 @@ def register_pivot_plans(
             developed_from_split=DatasetSplit.DEVELOPMENT,
             config_hash=config_hash,
             source_indicator_ids=[indicator.indicator_id],
+            source_assertion_ids=[indicator.assertion_id],
+            source_available_at=available_at,
             registered_at=registered_at,
         )
         plans.append(PivotPlan(

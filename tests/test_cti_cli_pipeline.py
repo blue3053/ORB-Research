@@ -26,8 +26,10 @@ if "yaml" not in sys.modules:
     sys.modules["yaml"] = yaml_stub
 
 from src import cli
+from src.cti.corpus_registry import CorpusRegistry
 from src.cti.search_protocol import build_search_protocol
 from src.cti.snapshots import FetchedDocument
+from src.models import AcquisitionMode, CorpusPurpose, SourceAccessClass, TimePrecision
 
 
 class SearchBackend:
@@ -39,7 +41,7 @@ class SearchBackend:
     def search(self, query):
         return [{
             "title": "Threat report", "url": "https://research.badinfra.net/report",
-            "published_at": "2026-01-01",
+            "published_at": "2026-01-01T00:00:00Z",
         }]
 
 
@@ -104,15 +106,41 @@ class CtiCliPipelineTests(unittest.TestCase):
             "publisher": "Research Example",
             "title": "Fixture report",
             "published_at": "2026-01-01T00:00:00Z",
+            "published_time_precision": "exact_timestamp",
+            "source_timezone": "UTC",
             "retrieved_at": "2026-07-14T00:00:00Z",
             "content_sha256": "a" * 64,
             "acquisition_mode": "existing_curated",
+            "source_access_class": "restricted",
+            "corpus_purpose": "development",
             "source_independence": "commercial_cti_research",
         }
 
-        document = cli._document_from_snapshot_metadata(metadata, None)
+        document = cli._document_from_snapshot_metadata(metadata, None, None, None)
 
         self.assertEqual("commercial_cti_research", document.source_independence)
+
+    def test_date_only_publication_remains_non_exact(self):
+        metadata = {
+            "document_id": "cti-doc-date-only",
+            "final_url": "https://research.example/date-only",
+            "publisher": "Research Example",
+            "title": "Date-only report",
+            "published_at": "2026-01-01",
+            "published_time_precision": "date",
+            "source_timezone": "unknown",
+            "retrieved_at": "2026-07-14T00:00:00Z",
+            "content_sha256": "b" * 64,
+            "acquisition_mode": "systematic_public",
+            "source_access_class": "public",
+            "corpus_purpose": "development",
+        }
+
+        document = cli._document_from_snapshot_metadata(metadata, None, None, None)
+
+        self.assertIsNone(document.published_at)
+        self.assertEqual("2026-01-01", document.published_at_raw)
+        self.assertEqual(TimePrecision.DATE, document.published_time_precision)
 
     def test_structured_extraction_cli_verifies_and_records_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -127,8 +155,13 @@ class CtiCliPipelineTests(unittest.TestCase):
                 "publisher": "research.badinfra.net",
                 "title": "Threat report",
                 "published_at": "2026-01-01",
+                "published_time_precision": "date",
+                "source_timezone": "unknown",
                 "retrieved_at": "2026-07-13T02:00:00Z",
                 "content_sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+                "acquisition_mode": "systematic_public",
+                "source_access_class": "public",
+                "corpus_purpose": "development",
                 "snapshot_path": str(snapshot_path),
             }
             metadata_path = root / "metadata.json"
@@ -162,6 +195,9 @@ class CtiCliPipelineTests(unittest.TestCase):
                 target_publishers=["badinfra.net"], search_terms=["ORB report"],
                 inclusion_rules=["technical"], exclusion_rules=["marketing"],
                 deduplication_rule="canonical_url",
+                research_cutoff_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+                source_access_class=SourceAccessClass.PUBLIC,
+                acquisition_mode=AcquisitionMode.SYSTEMATIC_PUBLIC,
                 registered_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
             )
             (root / "protocol.json").write_text(protocol.model_dump_json(), encoding="utf-8")
@@ -193,6 +229,18 @@ class CtiCliPipelineTests(unittest.TestCase):
                     "--whitelist", "badinfra.net", "--retrieved-at", "2026-07-13T02:00:00Z",
                 ])
             snapshot = json.loads((root / "snapshots.json").read_text(encoding="utf-8"))[0]
+            family_manifest = {
+                "source_family": {
+                    "source_family_id": "family-badinfra-report",
+                    "canonical_document_id": snapshot["document_id"],
+                    "reviewer_id": "human-reviewer",
+                    "reviewed_at": "2026-07-13T02:15:00Z",
+                },
+                "relationships": [],
+            }
+            (root / "source-family.json").write_text(
+                json.dumps(family_manifest), encoding="utf-8"
+            )
             candidates = [{
                 "scope": "domain", "raw_form": "relay[.]badinfra[.]net",
                 "observed_at": "2026-01-01T00:00:00Z", "context": "malicious",
@@ -209,6 +257,7 @@ class CtiCliPipelineTests(unittest.TestCase):
                     "cti-register-indicators",
                     "--verified-manifest", str(root / "verified.json"),
                     "--snapshot-metadata", snapshot["metadata_path"],
+                    "--source-family-manifest", str(root / "source-family.json"),
                     "--db", str(db), "--ingested-at", "2026-07-13T02:30:00Z",
                     "--out", str(root / "indicator-registration.json"),
                 ])
@@ -222,6 +271,7 @@ class CtiCliPipelineTests(unittest.TestCase):
                     "cti-register-indicators",
                     "--verified-manifest", str(root / "verified.json"),
                     "--snapshot-metadata", snapshot["metadata_path"],
+                    "--source-family-manifest", str(root / "source-family.json"),
                     "--db", str(db), "--ingested-at", "2026-07-13T02:30:00Z",
                     "--out", str(root / "indicator-registration.json"),
                 ])
@@ -231,6 +281,29 @@ class CtiCliPipelineTests(unittest.TestCase):
                     "candidate",
                     connection.execute("SELECT verdict FROM indicator_assertions").fetchone()[0],
                 )
+            reviews = [{
+                "review_id": "review-fixture",
+                "assertion_id": registration["assertion_ids"][0],
+                "decision": "accepted",
+                "reviewer_id": "human-reviewer",
+                "reviewed_at": "2026-07-13T02:45:00Z",
+                "reviewed_role": "relay_orb",
+                "source_confidence": 0.9,
+                "extraction_confidence": 0.9,
+                "role_confidence": 0.8,
+                "notes_hash": "f" * 64,
+            }]
+            (root / "assertion-reviews.json").write_text(
+                json.dumps(reviews), encoding="utf-8"
+            )
+            cli.main([
+                "cti-review-assertions", "--db", str(db),
+                "--reviews", str(root / "assertion-reviews.json"),
+                "--out", str(root / "assertion-review-result.json"),
+            ])
+            (root / "accepted-assertions.json").write_text(
+                json.dumps(registration["assertion_ids"]), encoding="utf-8"
+            )
             template = {
                 "templates": {"domain": {
                     "field": "host.dns.names", "template": 'host.dns.names: "{pivot_value}"'
@@ -240,7 +313,9 @@ class CtiCliPipelineTests(unittest.TestCase):
             (root / "templates.yaml").write_text("fixture", encoding="utf-8")
             with patch.object(cli.yaml, "safe_load", return_value=template):
                 cli.main([
-                    "cti-plan-pivots", "--verified-manifest", str(root / "verified.json"),
+                    "cti-plan-pivots", "--accepted-assertions",
+                    str(root / "accepted-assertions.json"),
+                    "--cutoff-at", "2026-07-13T02:45:00Z",
                     "--db", str(db), "--orbhunt", r"D:\Gemini\ORB_Hunt_v5",
                     "--template-config", str(root / "templates.yaml"),
                     "--registered-at", "2026-07-13T03:00:00Z", "--version", "1",
@@ -249,6 +324,14 @@ class CtiCliPipelineTests(unittest.TestCase):
             plans = json.loads((root / "plans.json").read_text(encoding="utf-8"))
             self.assertEqual("Q1_DIRECT_PIVOT", plans[0]["query_class"])
             self.assertEqual("registered_not_executed", plans[0]["status"])
+            self.assertTrue(CorpusRegistry(db).phase_a_gate_report()["passed"])
+            cli.main([
+                "cti-audit-phase-a", "--db", str(db),
+                "--out", str(root / "phase-a-audit.json"),
+            ])
+            self.assertTrue(json.loads(
+                (root / "phase-a-audit.json").read_text(encoding="utf-8")
+            )["passed"])
 
 
 if __name__ == "__main__":

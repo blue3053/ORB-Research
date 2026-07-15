@@ -23,6 +23,7 @@ if "yaml" not in sys.modules:
     sys.modules["yaml"] = yaml_stub
 
 from src import cli
+from src.censys.q0_seed import register_q0_seed
 from src.censys.query_registry import QueryRegistry
 
 
@@ -65,15 +66,15 @@ class CliIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             db = root / "registry.sqlite"
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                self.assertEqual(0, cli.main([
-                    "register-q0", "--db", str(db), "--indicator-id", "ioc-1",
-                    "--ip", "192.0.2.9", "--indicator-available-at", "2026-01-01T00:00:00Z",
-                    "--registered-at", "2026-01-02T00:00:00Z", "--version", "1",
-                    "--config-hash", "cfg",
-                ]))
-            query_id = json.loads(output.getvalue())["query_id"]
+            query = register_q0_seed(
+                QueryRegistry(db), indicator_id="ioc-1", ip_value="192.0.2.9",
+                indicator_available_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                source_assertion_id="assert-1",
+                cutoff_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                registered_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                query_version="1", config_hash="cfg",
+            )
+            query_id = query.query_id
             output = io.StringIO()
             with patch.object(cli, "CensysQ0HostLookupFetcher", return_value=FakeLiveFetcher()):
                 with contextlib.redirect_stdout(output):

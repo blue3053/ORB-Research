@@ -12,13 +12,21 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from src.models import SearchProtocolRecord
+from src.models import (
+    AcquisitionMode,
+    SearchProtocolRecord,
+    SourceAccessClass,
+    utc,
+)
 from src.provenance import canonical_json_hash
 
 
 def build_search_protocol(
     *,
     version: str,
+    research_cutoff_at: datetime,
+    source_access_class: SourceAccessClass,
+    acquisition_mode: AcquisitionMode,
     target_date_from: str,
     target_date_to: str,
     target_publishers: list[str],
@@ -30,8 +38,14 @@ def build_search_protocol(
 ) -> SearchProtocolRecord:
     """검색 프로토콜의 내용 hash와 deterministic ID를 생성한다."""
 
+    cutoff = utc(research_cutoff_at)
+    access_class = SourceAccessClass(source_access_class)
+    mode = AcquisitionMode(acquisition_mode)
     payload = {
         "protocol_version": version,
+        "research_cutoff_at": cutoff.isoformat(),
+        "source_access_class": access_class.value,
+        "acquisition_mode": mode.value,
         "target_date_from": target_date_from,
         "target_date_to": target_date_to,
         "target_publishers": target_publishers,
@@ -63,4 +77,3 @@ def expand_search_terms(
         else:
             expanded.append(term)
     return list(dict.fromkeys(expanded))
-
