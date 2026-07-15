@@ -1,0 +1,35 @@
+# 목적: 재사용하는 외부 코드의 commit·dirty 상태·핵심 파일 SHA-256을 고정한다.
+# 주의: 두 원본 저장소는 감사 당시 기존 미커밋 변경이 있었으며 runtime은 내부 파생본만 사용한다.
+# 라이선스: 감사 시점에 명시적 LICENSE/COPYING/NOTICE 파일이 없어 내부 연구용으로 제한한다.
+
+sources:
+  cti_agent:
+    path: "D:/Claude/CTI-Agent"
+    commit: "1d5e1b6b7bf294dc5b63fc3cde81f23fa4d176d9"
+    dirty_at_audit: true
+    license_file: null
+    distribution_policy: internal_research_only
+    files:
+      src/collectors/search_collector.py: "C960866D2B246195F878CFE9D5B8CA6A65825542EF1270297C568ADA73AF7F4A"
+      src/collectors/base.py: "271C069849BF827B334F074C913DB5AB2F5AB20E42C7F585E5EA38453485899D"
+      src/pipeline/ioc_extract.py: "85304CF1EA78054A49F6345201F0D7F70AA6A853DE6FA459DE4B1E46C3DEA645"
+      src/utils/ioc_regex.py: "B576C7DBA5D958C8D26E4637ADF9DB4F92C8541F401820A0CABB7D751AF36A31"
+    adapted_files:
+      src/reused/cti_agent/ioc_regex.py: "47E460D91B44BDF81C6A6AC78E5E3177A6C1115E8DB529B87F6AF3ED92D2DF4E"
+      src/reused/cti_agent/search_rules.py: "DFFEB0D036A6F1FE58AA14D1BC0021548F5D9F2A1D7D82F0108880C61250A12F"
+  orbhunt_v5:
+    path: "D:/Gemini/ORB_Hunt_v5"
+    commit: "a9add3c272457246f19fdb073e1e1e465062732c"
+    dirty_at_audit: true
+    license_file: null
+    distribution_policy: internal_research_only
+    files:
+      src/orbhunt/stages/censys_query.py: "DDCD516594D9975B4BEAB127CD6EEE45EF347386CDF7C9F157AFF2BF61C753B5"
+      src/orbhunt/stages/censys_collect.py: "BD4AC358CCBD5F603C9D58AB3960A39EED7769ED0F4A9B4D33E729896E64FB03"
+      src/orbhunt/stages/pivot_safety.py: "284AA93287AD96BA10071D5A1382388FA94D0C4696FF2807BABE0928B571FE24"
+      src/orbhunt/schemas/models.py: "FDF31B2E4631DA200B108BEAF076677B23DEB11FB6C95A852D12E62389362979"
+    adapted_files:
+      src/reused/orbhunt_v5/censys_query.py: "9FE5A19DE0B19B6FBF9F58492C5A0DCB8FD53A69D83D988D7C6BFB3A3D2E958F"
+      src/reused/orbhunt_v5/error_policy.py: "14BCB9C56B865B7C261866488B361611E44DD1678BFA87D507ACE33D5A1048BA"
+      src/reused/orbhunt_v5/pivot_safety.py: "B5FC2E51C06F761262EE471A2FF4F5168907F9DA2775FB87F28A6ED35CFE498D"
+      src/reused/orbhunt_v5/result_parser.py: "D4918B53EA6D4979B89CF1E010E0E1F430397D0F0BFED72F1B62AF848EA320BC"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CTI/Censys Pipeline Implementer"
+  short_description: "단계별 AI 라우팅으로 CTI/Censys 연구 파이프라인 구현"
+  default_prompt: "Use $cti-censys-pipeline-implementation-skill to inspect the blueprint and current code, then implement the smallest safe gated increment."

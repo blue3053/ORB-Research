@@ -1,0 +1,33 @@
+# 목적: ORB 논문용 재현 가능한 CTI·Censys 통합 연구 패키지의 빌드와 의존성을 정의한다.
+# 설계: CTI-Agent와 ORB_Hunt_v5에서 검토·복사·보완한 pure logic 내부 파생본과 연구 통제 계층을 이 패키지에 둔다.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orb-research"
+version = "0.1.0"
+description = "Reproducible ORB CTI and passive Censys research control plane"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40",
+    "jsonschema>=4.0",
+    "pypdf>=5.0",
+    "pydantic>=2.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "reportlab>=4.0"]
+
+[project.scripts]
+orb-research = "src.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

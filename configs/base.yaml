@@ -1,0 +1,71 @@
+# 목적: 논문 연구 패키지의 외부 원천, 저장 위치, 시간·보안 기본 정책을 선언한다.
+# 설계: 절대경로는 사용자 환경 설정이며 코드에 시크릿을 저장하지 않는다.
+
+project_timezone: Asia/Seoul
+research_start_at: "2026-07-13T00:00:00+09:00"
+
+source_projects:
+  cti_agent:
+    path: "D:/Claude/CTI-Agent"
+    read_only: true
+  orbhunt_v5:
+    path: "D:/Gemini/ORB_Hunt_v5"
+    read_only: true
+
+storage:
+  registry_db: "data_registry/orb_research.sqlite"
+  manifests: "data_registry/manifests"
+  raw: "data/raw"
+  curated: "data/curated"
+  existing_cti: "data/cti"
+
+security:
+  passive_data_only: true
+  allow_active_scanning: false
+  allow_automatic_blocking: false
+  require_live_censys_gate: true
+  live_censys_gate_name: ALLOW_LIVE_CENSYS
+
+query_policy:
+  classes: [Q0_SEED, Q1_DIRECT_PIVOT, Q2_DERIVED, Q3_CLUSTER]
+  splits: [development, validation, prospective_test, operational]
+  require_freeze_for_prospective_test: true
+
+cti_search:
+  require_registered_protocol: true
+  require_domain_whitelist: true
+  publication_date_fallback: prohibited
+  require_manual_screening: true
+  backend: brave-web-search-v1
+  count: 20
+  max_pages: 10
+  snapshot_max_bytes: 26214400
+  search_live_gate_name: ALLOW_LIVE_CTI_SEARCH
+  snapshot_live_gate_name: ALLOW_CTI_SNAPSHOT_FETCH
+  domain_whitelist:
+    - cisa.gov
+    - mandiant.com
+    - microsoft.com
+    - security.googleblog.com
+    - unit42.paloaltonetworks.com
+
+cti_ioc_extraction:
+  backend: anthropic-structured-tool
+  model: claude-sonnet-4-6
+  prompt_path: configs/2026-07-14-ioc-extract-v1.md
+  max_input_chars: 200000
+  max_tokens: 8192
+  max_pdf_pages: 500
+  max_document_chars: 2000000
+  live_gate_name: ALLOW_LIVE_CTI_EXTRACTION
+  require_raw_form_source_match: true
+
+censys_collection:
+  api_surface: censys-platform-v3
+  endpoint: "https://api.platform.censys.io/v3/global/search/query"
+  page_size: 100
+  max_pages: null
+  fields: []
+  raw_page_pattern: "page-{page_number:06d}.json"
+  checkpoint_file: checkpoints.jsonl
+  exclude_partial_runs_from_analysis: true
