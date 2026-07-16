@@ -105,6 +105,18 @@ class CensysCollectionConfig(StrictConfigModel):
     exclude_partial_runs_from_analysis: bool = True
 
 
+class PhaseBPolicyConfig(StrictConfigModel):
+    """Stage 2/3 continuity and bounded-precheck fail-closed policy."""
+
+    continuity_statuses: list[Literal[
+        "continuous", "probable", "unknown", "reassigned", "contradicted"
+    ]] = ["continuous", "probable", "unknown", "reassigned", "contradicted"]
+    require_review_for_probable: Literal[True] = True
+    precheck_page_budget: int = Field(default=2, ge=1)
+    exclude_partial_prechecks_from_q2: Literal[True] = True
+    require_eligible_precheck_for_q2: Literal[True] = True
+
+
 class CtiIocExtractionConfig(StrictConfigModel):
     """CTI 원문 structured extraction의 모델·입력 상한·live gate 정책."""
 
@@ -132,6 +144,7 @@ class ProjectConfig(StrictConfigModel):
     cti_corpus: CtiCorpusConfig
     cti_ioc_extraction: CtiIocExtractionConfig
     censys_collection: CensysCollectionConfig
+    phase_b_policy: PhaseBPolicyConfig = Field(default_factory=PhaseBPolicyConfig)
     config_path: Path | None = Field(default=None, exclude=True)
 
     @field_validator("research_start_at")

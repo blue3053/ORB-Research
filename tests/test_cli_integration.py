@@ -42,16 +42,16 @@ class FakeLiveFetcher:
 
 
 class CliIntegrationTests(unittest.TestCase):
-    def test_register_query_preserves_source_provenance(self):
+    def test_register_generic_query_preserves_source_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             db = Path(directory) / "registry.sqlite"
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 self.assertEqual(0, cli.main([
-                    "register-query", "--db", str(db), "--version", "q2-v1",
-                    "--class", "Q2_DERIVED",
+                    "register-query", "--db", str(db), "--version", "q3-v1",
+                    "--class", "Q3_CLUSTER",
                     "--query-text", "host.services.port=9960 and host.services.port=9961",
-                    "--split", "development", "--config-hash", "cfg-q2",
+                    "--split", "development", "--config-hash", "cfg-q3",
                     "--source-indicator-id", "ioc-seed",
                     "--source-feature-id", "fp-portset",
                     "--source-feature-id", "fp-jarm",

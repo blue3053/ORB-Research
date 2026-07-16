@@ -75,3 +75,10 @@ censys_collection:
   raw_page_pattern: "page-{page_number:06d}.json"
   checkpoint_file: checkpoints.jsonl
   exclude_partial_runs_from_analysis: true
+
+phase_b_policy:
+  continuity_statuses: [continuous, probable, unknown, reassigned, contradicted]
+  require_review_for_probable: true
+  precheck_page_budget: 2
+  exclude_partial_prechecks_from_q2: true
+  require_eligible_precheck_for_q2: true

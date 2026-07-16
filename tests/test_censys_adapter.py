@@ -105,6 +105,47 @@ class CensysAdapterTests(unittest.TestCase):
             batch.host_observations[0].indicator_id,
         )
 
+    def test_service_time_and_phase_b_fingerprints_are_preserved(self) -> None:
+        query = QueryRecord(
+            query_id="qry-fields", query_version="1",
+            query_class=QueryClass.Q1_DIRECT_PIVOT,
+            query_text='host.dns.names: "relay.example.org"', query_hash="f" * 64,
+            developed_from_split=DatasetSplit.DEVELOPMENT,
+            registered_at=datetime(2026, 1, 1, tzinfo=timezone.utc), config_hash="cfg",
+        )
+        execution = QueryExecutionRecord(
+            query_run_id="run-fields", query_id=query.query_id,
+            query_hash=query.query_hash,
+            cutoff_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            executed_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            dataset_split=DatasetSplit.DEVELOPMENT, result_count=1,
+            result_manifest_hash="m" * 64, api_schema_version="v3", status="complete",
+        )
+        hit = {"host": {
+            "ip": "198.51.100.9", "last_updated_at": "2026-01-01T12:00:00Z",
+            "services": [{
+                "port": 443, "transport_protocol": "tcp", "service_name": "HTTPS",
+                "observed_at": "2026-01-01T11:00:00Z",
+                "spki_sha256": "s" * 64, "ja4": "ja4-fixture",
+                "ssh_key_hash": "ssh-fixture",
+                "software": [{"vendor": "Acme", "product": "Gateway", "version": "1"}],
+            }],
+        }}
+        batch = self.adapter.normalize_cached_pages(
+            page_records=[{"query_hash": query.query_hash,
+                           "response": {"result": {"hits": [hit]}}}],
+            query=query, execution=execution,
+            collected_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            extractor_version="test", public_id_hmac_key=b"k" * 32,
+        )
+        service = batch.service_observations[0]
+        self.assertEqual(datetime(2026, 1, 1, 11, tzinfo=timezone.utc), service.observed_at)
+        self.assertEqual("censys_service_observed_at", service.observation_time_basis.value)
+        self.assertEqual("s" * 64, service.spki_sha256)
+        self.assertEqual("ja4-fixture", service.ja4)
+        self.assertEqual("ssh-fixture", service.ssh_key_hash)
+        self.assertEqual("Gateway", service.software_product)
+
     def test_q2_hit_reuses_known_ip_indicator_and_only_discovers_new_ip(self) -> None:
         query = QueryRecord(
             query_id="qry-q2", query_version="1", query_class=QueryClass.Q2_DERIVED,

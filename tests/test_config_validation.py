@@ -63,6 +63,8 @@ class ConfigValidationTests(unittest.TestCase):
             config.cti_corpus.development_excluded_acquisition_modes,
         )
         self.assertEqual(100, config.censys_collection.page_size)
+        self.assertTrue(config.phase_b_policy.require_eligible_precheck_for_q2)
+        self.assertEqual(2, config.phase_b_policy.precheck_page_budget)
 
     def test_rejects_unknown_and_unsafe_values(self):
         unknown = valid_config()

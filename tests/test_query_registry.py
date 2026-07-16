@@ -133,6 +133,32 @@ class QueryRegistryTests(unittest.TestCase):
             }
         self.assertIn("source_assertion_ids_json", columns)
         self.assertIn("source_available_at", columns)
+        self.assertIn("source_precheck_ids_json", columns)
+
+    def test_partial_execution_can_resume_under_same_run_id(self) -> None:
+        query = self._register()
+        partial = QueryExecutionRecord(
+            query_run_id="run-resume", query_id=query.query_id,
+            query_hash=query.query_hash, cutoff_time=self.t0,
+            executed_at=self.t0 + timedelta(hours=1),
+            dataset_split=DatasetSplit.DEVELOPMENT, result_count=2,
+            result_manifest_hash="partial-manifest", api_schema_version="fixture",
+            status="partial_max_pages",
+        )
+        self.assertTrue(self.registry.record_execution(partial))
+        complete = partial.model_copy(update={
+            "result_count": 5, "result_manifest_hash": "complete-manifest",
+            "status": "complete",
+        })
+        self.assertTrue(self.registry.record_execution(complete))
+        self.assertFalse(self.registry.record_execution(complete))
+        self.assertEqual("complete", self.registry.get_execution("run-resume").status)
+        with self.registry.connect() as connection:
+            events = connection.execute(
+                "SELECT status FROM query_execution_events WHERE query_run_id=? "
+                "ORDER BY rowid", ("run-resume",),
+            ).fetchall()
+        self.assertEqual(["partial_max_pages", "complete"], [row[0] for row in events])
 
 
 if __name__ == "__main__":

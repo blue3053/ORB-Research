@@ -1,5 +1,9 @@
 # ORB-Research
 
+> 2026-07-16 상태: Phase B(Stage 2–3) 구현과 오프라인 회귀 검증을 완료했습니다.
+> Q0 landmark/continuity와 bounded Q1 precheck, 사람 검토 기반 Q2 진입 게이트가 동작합니다.
+> 상세 결과는 [Phase B 완료 보고서](docs/2026-07-16-phase-b-completion.md)를 기준으로 합니다.
+
 > 2026-07-15 상태: Phase A(Stage 0–1)의 protocol/corpus 및 CTI assertion
 > acceptance gate 구현이 완료되었습니다. 최신 결과는
 > [Phase A 완료 보고서](docs/2026-07-15-phase-a-completion.md)를 기준으로 합니다.
@@ -152,6 +156,14 @@ cti-plan-pivots
 cti-export-public-corpus
 cti-audit-stage0
 cti-audit-phase-a
+q0-assess-continuity
+q0-review-continuity
+cti-register-composite
+cti-register-precheck
+cti-record-precheck-result
+cti-review-precheck
+register-q2
+cti-audit-phase-b
 ```
 
 각 명령의 현재 인자는 CLI help를 기준으로 확인합니다.

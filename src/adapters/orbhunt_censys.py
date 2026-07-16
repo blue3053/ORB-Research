@@ -217,6 +217,7 @@ class OrbhuntCensysAdapter:
                     query.query_class.value, query.query_hash,
                 )
                 first = flattened[0] if flattened else {}
+                raw_services = host.get("services") if isinstance(host.get("services"), list) else []
                 hosts.append(HostObservationRecord(
                     observation_id=observation_id,
                     indicator_id=indicator_id,
@@ -237,6 +238,26 @@ class OrbhuntCensysAdapter:
                         continue
                     transport_value = str(item.get("protocol") or "tcp").lower()
                     transport = Transport.UDP if transport_value == "udp" else Transport.TCP
+                    raw_service = next((
+                        service for service in raw_services
+                        if isinstance(service, dict) and service.get("port") == port
+                    ), {})
+                    service_observed = _optional_utc(
+                        item.get("service_last_observed_at")
+                        or raw_service.get("observed_at")
+                        or raw_service.get("last_updated_at")
+                    )
+                    if service_observed and service_observed > collected:
+                        raise ValueError(
+                            "Censys service observed_at cannot be later than collected_at"
+                        )
+                    software_items = (
+                        raw_service.get("software")
+                        if isinstance(raw_service.get("software"), list) else []
+                    )
+                    software = next(
+                        (value for value in software_items if isinstance(value, dict)), {}
+                    )
                     service_material = f"{observation_id}|{port}|{transport.value}"
                     services.append(ServiceObservationRecord(
                         service_observation_id=f"svc-{sha256_text(service_material)[:20]}",
@@ -244,10 +265,31 @@ class OrbhuntCensysAdapter:
                         port=port,
                         transport=transport,
                         protocol=str(item.get("service_name") or "unknown"),
+                        observed_at=service_observed,
+                        observation_time_basis=(
+                            ObservationTimeBasis.CENSYS_SERVICE_OBSERVED_AT
+                            if service_observed else ObservationTimeBasis.UNAVAILABLE
+                        ),
                         banner_hash=_normalized_text_hash(item.get("http_banner")),
                         http_title_hash=_normalized_text_hash(item.get("http_title")),
                         cert_sha256=item.get("cert_sha256"),
+                        spki_sha256=(
+                            _nested(raw_service, "tls.certificates.leaf_data.spki_subject_fingerprint")
+                            or _nested(raw_service, "tls.certificates.leaf_data.spki_sha256")
+                            or raw_service.get("spki_sha256")
+                        ),
                         jarm=item.get("jarm"),
+                        ja4=(
+                            _nested(raw_service, "tls.ja4")
+                            or raw_service.get("ja4")
+                        ),
+                        ssh_key_hash=(
+                            _nested(raw_service, "ssh.server_host_key.fingerprint_sha256")
+                            or raw_service.get("ssh_key_hash")
+                        ),
+                        software_vendor=software.get("vendor"),
+                        software_product=software.get("product"),
+                        software_version=software.get("version"),
                         extractor_version=extractor_version,
                     ))
         if hit_count == 0 and query.query_class is QueryClass.Q0_SEED:

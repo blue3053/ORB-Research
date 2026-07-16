@@ -152,6 +152,29 @@ class ObservationTimeBasis(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class ContinuityStatus(StrEnum):
+    CONTINUOUS = "continuous"
+    PROBABLE = "probable"
+    UNKNOWN = "unknown"
+    REASSIGNED = "reassigned"
+    CONTRADICTED = "contradicted"
+
+
+class TimelineObservationKind(StrEnum):
+    POSITIVE = "positive"
+    NOT_FOUND = "not_found"
+    MISSING_SCAN = "missing_scan"
+    NO_RESPONSE = "no_response"
+    API_ERROR = "api_error"
+
+
+class PrecheckStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETE = "complete"
+    PARTIAL_MAX_PAGES = "partial_max_pages"
+    FAILED = "failed"
+
+
 class FingerprintType(StrEnum):
     CERT = "cert"
     SPKI = "spki"
@@ -430,6 +453,8 @@ class ServiceObservationRecord(StrictUTCModel):
     port: int = Field(ge=1, le=65535)
     transport: Transport
     protocol: str
+    observed_at: datetime | None = None
+    observation_time_basis: ObservationTimeBasis = ObservationTimeBasis.UNAVAILABLE
     extended_service: str | None = None
     banner_hash: str | None = None
     http_title_hash: str | None = None
@@ -442,6 +467,187 @@ class ServiceObservationRecord(StrictUTCModel):
     software_product: str | None = None
     software_version: str | None = None
     extractor_version: str
+
+    _observed_at_utc = field_validator("observed_at")(
+        lambda value: None if value is None else utc(value)
+    )
+
+
+class Q0LandmarkRecord(StrictUTCModel):
+    landmark_id: str
+    indicator_id: str
+    assertion_id: str
+    query_id: str
+    landmark_reason: str
+    observation_window_start: datetime
+    observation_window_end: datetime
+    source_available_at: datetime
+    registered_at: datetime
+
+    _window_start_utc = field_validator("observation_window_start")(utc)
+    _window_end_utc = field_validator("observation_window_end")(utc)
+    _source_available_utc = field_validator("source_available_at")(utc)
+    _landmark_registered_utc = field_validator("registered_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_landmark_window(self) -> "Q0LandmarkRecord":
+        if self.observation_window_end < self.observation_window_start:
+            raise ValueError("landmark observation window is reversed")
+        if self.source_available_at > self.registered_at:
+            raise ValueError("landmark predates source availability")
+        return self
+
+
+class Q0TimelineEntryRecord(StrictUTCModel):
+    timeline_entry_id: str
+    landmark_id: str
+    observation_id: str
+    observation_kind: TimelineObservationKind
+    observed_at: datetime | None = None
+    collected_at: datetime
+    host_observed: bool
+    negative_reason: NegativeReason | None = None
+    fingerprint_ids: list[str] = Field(default_factory=list)
+    raw_record_hash: str
+
+    _timeline_observed_utc = field_validator("observed_at")(
+        lambda value: None if value is None else utc(value)
+    )
+    _timeline_collected_utc = field_validator("collected_at")(utc)
+
+
+class ContinuityAssessmentRecord(StrictUTCModel):
+    assessment_id: str
+    landmark_id: str
+    status: ContinuityStatus
+    assessed_at: datetime
+    window_start: datetime
+    window_end: datetime
+    current_response: bool | None
+    historical_positive_count: int = Field(ge=0)
+    missing_scan_count: int = Field(ge=0)
+    last_positive_at: datetime | None = None
+    stable_fingerprint_ids: list[str] = Field(default_factory=list)
+    conflicting_fingerprint_ids: list[str] = Field(default_factory=list)
+    evidence_observation_ids: list[str] = Field(default_factory=list)
+    derived_pivot_allowed: bool = False
+
+    _continuity_assessed_utc = field_validator("assessed_at")(utc)
+    _continuity_start_utc = field_validator("window_start")(utc)
+    _continuity_end_utc = field_validator("window_end")(utc)
+    _last_positive_utc = field_validator("last_positive_at")(
+        lambda value: None if value is None else utc(value)
+    )
+
+
+class ContinuityReviewRecord(StrictUTCModel):
+    review_id: str
+    assessment_id: str
+    decision: ReviewerStatus
+    reviewer_id: str
+    reviewed_at: datetime
+    allow_probable: bool = False
+    notes_hash: str
+
+    _continuity_reviewed_utc = field_validator("reviewed_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_continuity_review(self) -> "ContinuityReviewRecord":
+        if self.decision is ReviewerStatus.PENDING:
+            raise ValueError("continuity review must be accepted or rejected")
+        if not self.reviewer_id.strip() or not re.fullmatch(r"[0-9a-f]{64}", self.notes_hash):
+            raise ValueError("continuity review provenance is invalid")
+        return self
+
+
+class PivotPrecheckRecord(StrictUTCModel):
+    precheck_id: str
+    query_id: str
+    query_hash: str
+    assertion_ids: list[str]
+    node_id: str
+    roles: list[AssertionRole]
+    scope: str
+    risk_flags: list[str] = Field(default_factory=list)
+    cutoff_at: datetime
+    source_available_at: datetime
+    page_budget: int = Field(ge=1)
+    registered_at: datetime
+
+    _precheck_cutoff_utc = field_validator("cutoff_at")(utc)
+    _precheck_source_utc = field_validator("source_available_at")(utc)
+    _precheck_registered_utc = field_validator("registered_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_precheck_time(self) -> "PivotPrecheckRecord":
+        if not self.assertion_ids or not self.node_id.strip() or not self.scope.strip():
+            raise ValueError("precheck assertion, node, and scope are required")
+        if self.source_available_at > self.cutoff_at:
+            raise ValueError("precheck source is available after cutoff")
+        if self.source_available_at > self.registered_at:
+            raise ValueError("precheck predates source availability")
+        return self
+
+
+class PivotPrecheckResultRecord(StrictUTCModel):
+    result_id: str
+    precheck_id: str
+    collection_run_id: str
+    status: PrecheckStatus
+    page_count: int = Field(ge=0)
+    hit_count: int = Field(ge=0)
+    hit_distribution: dict[str, int] = Field(default_factory=dict)
+    raw_manifest_hash: str | None = None
+    recorded_at: datetime
+    failure_reason: str | None = None
+
+    _precheck_recorded_utc = field_validator("recorded_at")(utc)
+
+
+class CtiCompositeRecord(StrictUTCModel):
+    composite_id: str
+    node_id: str
+    assertion_ids: list[str]
+    roles: list[AssertionRole]
+    window_start: datetime
+    window_end: datetime
+    available_at: datetime
+
+    _composite_start_utc = field_validator("window_start")(utc)
+    _composite_end_utc = field_validator("window_end")(utc)
+    _composite_available_utc = field_validator("available_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_composite(self) -> "CtiCompositeRecord":
+        if len(set(self.assertion_ids)) < 2:
+            raise ValueError("CTI composite requires two distinct assertions")
+        if self.window_end < self.window_start:
+            raise ValueError("CTI composite window is reversed")
+        if not self.window_start <= self.available_at <= self.window_end:
+            raise ValueError("CTI composite availability is outside its window")
+        return self
+
+
+class PivotEligibilityReviewRecord(StrictUTCModel):
+    review_id: str
+    precheck_id: str
+    decision: ReviewerStatus
+    reviewer_id: str
+    reviewed_at: datetime
+    reason_code: str
+    notes_hash: str
+
+    _eligibility_reviewed_utc = field_validator("reviewed_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_eligibility_review(self) -> "PivotEligibilityReviewRecord":
+        if self.decision is ReviewerStatus.PENDING:
+            raise ValueError("eligibility review must be accepted or rejected")
+        if not self.reason_code.strip() or not self.reviewer_id.strip():
+            raise ValueError("eligibility review reason and reviewer are required")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.notes_hash):
+            raise ValueError("eligibility notes_hash must be SHA-256")
+        return self
 
 
 class FingerprintRecord(StrictUTCModel):
@@ -483,6 +689,7 @@ class QueryRecord(StrictUTCModel):
     source_assertion_ids: list[str] = Field(default_factory=list)
     source_available_at: datetime | None = None
     source_feature_ids: list[str] = Field(default_factory=list)
+    source_precheck_ids: list[str] = Field(default_factory=list)
     developed_from_split: DatasetSplit
     registered_at: datetime
     frozen_at: datetime | None = None
@@ -499,10 +706,16 @@ class QueryRecord(StrictUTCModel):
 
     @model_validator(mode="after")
     def _validate_source_provenance_time(self) -> "QueryRecord":
-        if self.source_assertion_ids and not self.source_indicator_ids:
+        if (
+            self.source_assertion_ids
+            and not self.source_indicator_ids
+            and self.query_class is not QueryClass.Q2_DERIVED
+        ):
             raise ValueError("source assertions require source indicators")
         if self.source_available_at and self.source_available_at > self.registered_at:
             raise ValueError("query cannot predate source availability")
+        if self.source_precheck_ids and self.query_class is not QueryClass.Q2_DERIVED:
+            raise ValueError("source prechecks are valid only for Q2 queries")
         return self
 
 

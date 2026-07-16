@@ -19,6 +19,9 @@ from typing import Iterator
 
 from src.censys.query_lifecycle import ensure_execution_allowed, validate_transition
 from src.models import (
+    ContinuityAssessmentRecord,
+    ContinuityReviewRecord,
+    CtiCompositeRecord,
     DatasetSplit,
     EntityRelationRecord,
     EntityRelationType,
@@ -29,6 +32,12 @@ from src.models import (
     QueryExecutionRecord,
     QueryRecord,
     QueryStatus,
+    PivotEligibilityReviewRecord,
+    PivotPrecheckRecord,
+    PivotPrecheckResultRecord,
+    PrecheckStatus,
+    Q0LandmarkRecord,
+    Q0TimelineEntryRecord,
     ServiceObservationRecord,
 )
 from src.provenance import sha256_text
@@ -45,6 +54,7 @@ CREATE TABLE IF NOT EXISTS query_registry (
   source_assertion_ids_json TEXT NOT NULL DEFAULT '[]',
   source_available_at TEXT,
   source_feature_ids_json TEXT NOT NULL,
+  source_precheck_ids_json TEXT NOT NULL DEFAULT '[]',
   developed_from_split TEXT NOT NULL,
   registered_at TEXT NOT NULL,
   frozen_at TEXT,
@@ -65,6 +75,14 @@ CREATE TABLE IF NOT EXISTS query_executions (
   credits_or_bytes REAL,
   status TEXT NOT NULL,
   failure_reason TEXT
+);
+CREATE TABLE IF NOT EXISTS query_execution_events (
+  event_id TEXT PRIMARY KEY,
+  query_run_id TEXT NOT NULL REFERENCES query_executions(query_run_id),
+  status TEXT NOT NULL,
+  result_count INTEGER NOT NULL,
+  result_manifest_hash TEXT NOT NULL,
+  payload_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS host_observations (
   observation_id TEXT PRIMARY KEY,
@@ -106,6 +124,63 @@ CREATE TABLE IF NOT EXISTS entity_relations (
   available_at TEXT NOT NULL,
   payload_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS q0_landmarks (
+  landmark_id TEXT PRIMARY KEY,
+  indicator_id TEXT NOT NULL,
+  assertion_id TEXT NOT NULL,
+  query_id TEXT NOT NULL REFERENCES query_registry(query_id),
+  payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS q0_timeline_entries (
+  timeline_entry_id TEXT PRIMARY KEY,
+  landmark_id TEXT NOT NULL REFERENCES q0_landmarks(landmark_id),
+  observation_id TEXT NOT NULL REFERENCES host_observations(observation_id),
+  collected_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS continuity_assessments (
+  assessment_id TEXT PRIMARY KEY,
+  landmark_id TEXT NOT NULL REFERENCES q0_landmarks(landmark_id),
+  status TEXT NOT NULL,
+  assessed_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS continuity_reviews (
+  review_id TEXT PRIMARY KEY,
+  assessment_id TEXT NOT NULL UNIQUE REFERENCES continuity_assessments(assessment_id),
+  decision TEXT NOT NULL,
+  reviewed_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cti_composites (
+  composite_id TEXT PRIMARY KEY,
+  node_id TEXT NOT NULL,
+  available_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pivot_prechecks (
+  precheck_id TEXT PRIMARY KEY,
+  query_id TEXT NOT NULL REFERENCES query_registry(query_id),
+  node_id TEXT NOT NULL,
+  cutoff_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pivot_precheck_results (
+  result_id TEXT PRIMARY KEY,
+  precheck_id TEXT NOT NULL REFERENCES pivot_prechecks(precheck_id),
+  status TEXT NOT NULL,
+  page_count INTEGER NOT NULL,
+  hit_count INTEGER NOT NULL,
+  recorded_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pivot_eligibility_reviews (
+  review_id TEXT PRIMARY KEY,
+  precheck_id TEXT NOT NULL UNIQUE REFERENCES pivot_prechecks(precheck_id),
+  decision TEXT NOT NULL,
+  reviewed_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
 """
 
 
@@ -143,6 +218,11 @@ class QueryRegistry:
             connection.execute(
                 "ALTER TABLE query_registry ADD COLUMN source_available_at TEXT"
             )
+        if "source_precheck_ids_json" not in columns:
+            connection.execute(
+                "ALTER TABLE query_registry ADD COLUMN source_precheck_ids_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
 
     def register_query(
         self,
@@ -156,6 +236,7 @@ class QueryRegistry:
         source_assertion_ids: list[str] | None = None,
         source_available_at: datetime | None = None,
         source_feature_ids: list[str] | None = None,
+        source_precheck_ids: list[str] | None = None,
         registered_at: datetime | None = None,
     ) -> QueryRecord:
         query_text = query_text.strip()
@@ -173,6 +254,7 @@ class QueryRegistry:
             source_assertion_ids=source_assertion_ids or [],
             source_available_at=source_available_at,
             source_feature_ids=source_feature_ids or [],
+            source_precheck_ids=source_precheck_ids or [],
             developed_from_split=developed_from_split,
             registered_at=registered_at or datetime.now(timezone.utc),
             config_hash=config_hash,
@@ -190,9 +272,9 @@ class QueryRegistry:
                 "INSERT INTO query_registry "
                 "(query_id, query_version, query_class, query_text, query_hash, "
                 "source_indicator_ids_json, source_assertion_ids_json, source_available_at, "
-                "source_feature_ids_json, developed_from_split, registered_at, frozen_at, "
+                "source_feature_ids_json, source_precheck_ids_json, developed_from_split, registered_at, frozen_at, "
                 "valid_for_test_from, config_hash, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.query_id, record.query_version, record.query_class.value,
                     record.query_text, record.query_hash,
@@ -201,11 +283,51 @@ class QueryRegistry:
                     (record.source_available_at.isoformat()
                      if record.source_available_at else None),
                     json.dumps(record.source_feature_ids, sort_keys=True),
+                    json.dumps(record.source_precheck_ids, sort_keys=True),
                     record.developed_from_split.value, record.registered_at.isoformat(),
                     None, None, record.config_hash, record.status.value,
                 ),
             )
         return record
+
+    def register_q2_from_prechecks(
+        self,
+        *,
+        query_version: str,
+        query_text: str,
+        precheck_ids: list[str],
+        config_hash: str,
+        registered_at: datetime | None = None,
+    ) -> QueryRecord:
+        """Register Q2 only from complete, reviewed, eligible Q1 prechecks."""
+
+        unique_ids = sorted(set(precheck_ids))
+        if not unique_ids:
+            raise ValueError("Q2 requires at least one eligible precheck")
+        eligible = set(self.eligible_q2_precheck_ids())
+        blocked = [item for item in unique_ids if item not in eligible]
+        if blocked:
+            raise ValueError("Q2 source prechecks are not eligible: " + ", ".join(blocked))
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM pivot_prechecks WHERE precheck_id IN ("
+                + ",".join("?" for _ in unique_ids) + ")",
+                unique_ids,
+            ).fetchall()
+        prechecks = [PivotPrecheckRecord.model_validate_json(row[0]) for row in rows]
+        source_available_at = max(item.source_available_at for item in prechecks)
+        return self.register_query(
+            query_version=query_version,
+            query_class=QueryClass.Q2_DERIVED,
+            query_text=query_text,
+            developed_from_split=DatasetSplit.DEVELOPMENT,
+            config_hash=config_hash,
+            source_assertion_ids=sorted({value for item in prechecks for value in item.assertion_ids}),
+            source_indicator_ids=[],
+            source_available_at=source_available_at,
+            source_precheck_ids=unique_ids,
+            registered_at=registered_at,
+        )
 
     def mark_validated(self, query_id: str) -> QueryRecord:
         self._require_cti_assertion_provenance(self.get_query(query_id))
@@ -240,7 +362,7 @@ class QueryRegistry:
             )
         return self.get_query(query_id)
 
-    def record_execution(self, execution: QueryExecutionRecord) -> None:
+    def record_execution(self, execution: QueryExecutionRecord) -> bool:
         query = self.get_query(execution.query_id)
         if query.query_hash != execution.query_hash:
             raise ValueError("execution query hash does not match frozen registry query")
@@ -248,16 +370,76 @@ class QueryRegistry:
             query, execution.dataset_split, execution.executed_at, execution.cutoff_time
         )
         with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM query_executions WHERE query_run_id = ?",
+                (execution.query_run_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO query_executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        execution.query_run_id, execution.query_id, execution.query_hash,
+                        execution.cutoff_time.isoformat(), execution.executed_at.isoformat(),
+                        execution.dataset_split.value, execution.result_count,
+                        execution.result_manifest_hash, execution.api_schema_version,
+                        execution.credits_or_bytes, execution.status, execution.failure_reason,
+                    ),
+                )
+                changed = True
+            else:
+                immutable = {
+                    "query_id": execution.query_id,
+                    "query_hash": execution.query_hash,
+                    "cutoff_time": execution.cutoff_time.isoformat(),
+                    "executed_at": execution.executed_at.isoformat(),
+                    "dataset_split": execution.dataset_split.value,
+                    "api_schema_version": execution.api_schema_version,
+                }
+                mismatched = [
+                    name for name, value in immutable.items() if existing[name] != value
+                ]
+                if mismatched:
+                    raise ValueError(
+                        "query execution immutable fields changed: " + ", ".join(mismatched)
+                    )
+                same = (
+                    existing["result_count"] == execution.result_count
+                    and existing["result_manifest_hash"] == execution.result_manifest_hash
+                    and existing["status"] == execution.status
+                    and existing["failure_reason"] == execution.failure_reason
+                )
+                if same:
+                    return False
+                if existing["status"] != "partial_max_pages":
+                    raise ValueError("only partial_max_pages execution can be resumed")
+                if execution.status not in {"partial_max_pages", "complete"}:
+                    raise ValueError("partial execution has invalid resume transition")
+                if execution.result_count < existing["result_count"]:
+                    raise ValueError("resumed execution result_count cannot decrease")
+                connection.execute(
+                    "UPDATE query_executions SET result_count=?, result_manifest_hash=?, "
+                    "status=?, failure_reason=? WHERE query_run_id=?",
+                    (
+                        execution.result_count, execution.result_manifest_hash,
+                        execution.status, execution.failure_reason, execution.query_run_id,
+                    ),
+                )
+                changed = True
+            event_payload = json.dumps(
+                execution.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+            )
+            event_id = "execution-event-" + sha256_text(
+                execution.query_run_id + "|" + execution.status + "|"
+                + execution.result_manifest_hash
+            )[:20]
             connection.execute(
-                "INSERT INTO query_executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO query_execution_events VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    execution.query_run_id, execution.query_id, execution.query_hash,
-                    execution.cutoff_time.isoformat(), execution.executed_at.isoformat(),
-                    execution.dataset_split.value, execution.result_count,
-                    execution.result_manifest_hash, execution.api_schema_version,
-                    execution.credits_or_bytes, execution.status, execution.failure_reason,
+                    event_id, execution.query_run_id, execution.status,
+                    execution.result_count, execution.result_manifest_hash, event_payload,
                 ),
             )
+        return changed
 
     def get_query(self, query_id: str) -> QueryRecord:
         with self.connect() as connection:
@@ -359,6 +541,35 @@ class QueryRegistry:
             [HostObservationRecord.model_validate_json(row[0]) for row in host_rows],
             [ServiceObservationRecord.model_validate_json(row[0]) for row in service_rows],
         )
+
+    def load_indicator_observations(
+        self, indicator_id: str
+    ) -> tuple[list[HostObservationRecord], list[ServiceObservationRecord]]:
+        """Load all append-only observations for one indicator across query runs."""
+
+        with self.connect() as connection:
+            host_rows = connection.execute(
+                "SELECT payload_json FROM host_observations WHERE indicator_id=? "
+                "ORDER BY collected_at, observation_id", (indicator_id,),
+            ).fetchall()
+            service_rows = connection.execute(
+                "SELECT s.payload_json FROM service_observations s "
+                "JOIN host_observations h ON h.observation_id=s.observation_id "
+                "WHERE h.indicator_id=? ORDER BY s.service_observation_id", (indicator_id,),
+            ).fetchall()
+        return (
+            [HostObservationRecord.model_validate_json(row[0]) for row in host_rows],
+            [ServiceObservationRecord.model_validate_json(row[0]) for row in service_rows],
+        )
+
+    def get_pivot_precheck(self, precheck_id: str) -> PivotPrecheckRecord:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM pivot_prechecks WHERE precheck_id=?", (precheck_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(precheck_id)
+        return PivotPrecheckRecord.model_validate_json(row[0])
 
     @staticmethod
     def _immutable_payload(record) -> str:
@@ -490,6 +701,372 @@ class QueryRegistry:
                     ))
         return output
 
+    @staticmethod
+    def _model_payload(record) -> str:
+        return json.dumps(
+            record.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        )
+
+    def register_q0_landmark(self, landmark: Q0LandmarkRecord) -> bool:
+        query = self.get_query(landmark.query_id)
+        if query.query_class is not QueryClass.Q0_SEED:
+            raise ValueError("Q0 landmark requires a Q0 seed query")
+        if landmark.indicator_id not in query.source_indicator_ids:
+            raise ValueError("landmark indicator is not query provenance")
+        if landmark.assertion_id not in query.source_assertion_ids:
+            raise ValueError("landmark assertion is not query provenance")
+        payload = self._model_payload(landmark)
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM q0_landmarks WHERE landmark_id=?",
+                (landmark.landmark_id,),
+            ).fetchone()
+            if row:
+                if row[0] != payload:
+                    raise ValueError("Q0 landmark immutable ID collision")
+                return False
+            connection.execute(
+                "INSERT INTO q0_landmarks VALUES (?, ?, ?, ?, ?)",
+                (landmark.landmark_id, landmark.indicator_id, landmark.assertion_id,
+                 landmark.query_id, payload),
+            )
+        return True
+
+    def register_q0_timeline(self, entries: list[Q0TimelineEntryRecord]) -> int:
+        inserted = 0
+        with self.connect() as connection:
+            for entry in entries:
+                landmark = connection.execute(
+                    "SELECT indicator_id FROM q0_landmarks WHERE landmark_id=?", (entry.landmark_id,)
+                ).fetchone()
+                observation = connection.execute(
+                    "SELECT indicator_id FROM host_observations WHERE observation_id=?",
+                    (entry.observation_id,),
+                ).fetchone()
+                if landmark is None or observation is None:
+                    raise ValueError("timeline entry lacks landmark or raw observation")
+                if landmark[0] != observation[0]:
+                    raise ValueError("timeline entry observation does not match landmark indicator")
+                payload = self._model_payload(entry)
+                row = connection.execute(
+                    "SELECT payload_json FROM q0_timeline_entries WHERE timeline_entry_id=?",
+                    (entry.timeline_entry_id,),
+                ).fetchone()
+                if row:
+                    if row[0] != payload:
+                        raise ValueError("timeline entry immutable ID collision")
+                    continue
+                connection.execute(
+                    "INSERT INTO q0_timeline_entries VALUES (?, ?, ?, ?, ?)",
+                    (entry.timeline_entry_id, entry.landmark_id, entry.observation_id,
+                     entry.collected_at.isoformat(), payload),
+                )
+                inserted += 1
+        return inserted
+
+    def register_continuity_assessment(
+        self, assessment: ContinuityAssessmentRecord
+    ) -> bool:
+        payload = self._model_payload(assessment)
+        with self.connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM q0_landmarks WHERE landmark_id=?", (assessment.landmark_id,)
+            ).fetchone() is None:
+                raise ValueError("continuity assessment lacks Q0 landmark")
+            known = {
+                row[0] for row in connection.execute(
+                    "SELECT observation_id FROM q0_timeline_entries WHERE landmark_id=?",
+                    (assessment.landmark_id,),
+                )
+            }
+            if not set(assessment.evidence_observation_ids) <= known:
+                raise ValueError("continuity assessment references unknown timeline evidence")
+            row = connection.execute(
+                "SELECT payload_json FROM continuity_assessments WHERE assessment_id=?",
+                (assessment.assessment_id,),
+            ).fetchone()
+            if row:
+                if row[0] != payload:
+                    raise ValueError("continuity assessment immutable ID collision")
+                return False
+            connection.execute(
+                "INSERT INTO continuity_assessments VALUES (?, ?, ?, ?, ?)",
+                (assessment.assessment_id, assessment.landmark_id,
+                 assessment.status.value, assessment.assessed_at.isoformat(), payload),
+            )
+        return True
+
+    def register_continuity_review(self, review: ContinuityReviewRecord) -> bool:
+        payload = self._model_payload(review)
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM continuity_assessments WHERE assessment_id=?",
+                (review.assessment_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("continuity review references unknown assessment")
+            assessment = ContinuityAssessmentRecord.model_validate_json(row[0])
+            if review.reviewed_at < assessment.assessed_at:
+                raise ValueError("continuity review predates assessment")
+            if review.allow_probable and assessment.status.value != "probable":
+                raise ValueError("allow_probable applies only to probable continuity")
+            existing = connection.execute(
+                "SELECT payload_json FROM continuity_reviews WHERE assessment_id=?",
+                (review.assessment_id,),
+            ).fetchone()
+            if existing:
+                if existing[0] != payload:
+                    raise ValueError("continuity assessment already has immutable review")
+                return False
+            connection.execute(
+                "INSERT INTO continuity_reviews VALUES (?, ?, ?, ?, ?)",
+                (review.review_id, review.assessment_id, review.decision.value,
+                 review.reviewed_at.isoformat(), payload),
+            )
+        return True
+
+    def derived_continuity_assessment_ids(self) -> list[str]:
+        from src.censys.continuity import derived_pivot_allowed
+
+        allowed: list[str] = []
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT a.payload_json, r.payload_json FROM continuity_assessments a "
+                "LEFT JOIN continuity_reviews r ON r.assessment_id=a.assessment_id"
+            ).fetchall()
+        for assessment_payload, review_payload in rows:
+            assessment = ContinuityAssessmentRecord.model_validate_json(assessment_payload)
+            review = (ContinuityReviewRecord.model_validate_json(review_payload)
+                      if review_payload else None)
+            if derived_pivot_allowed(assessment, review):
+                allowed.append(assessment.assessment_id)
+        return sorted(allowed)
+
+    def register_cti_composite(self, composite: CtiCompositeRecord) -> bool:
+        payload = self._model_payload(composite)
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM cti_composites WHERE composite_id=?",
+                (composite.composite_id,),
+            ).fetchone()
+            if row:
+                if row[0] != payload:
+                    raise ValueError("CTI composite immutable ID collision")
+                return False
+            connection.execute(
+                "INSERT INTO cti_composites VALUES (?, ?, ?, ?)",
+                (composite.composite_id, composite.node_id,
+                 composite.available_at.isoformat(), payload),
+            )
+        return True
+
+    def register_pivot_precheck(self, precheck: PivotPrecheckRecord) -> bool:
+        query = self.get_query(precheck.query_id)
+        if query.query_class is not QueryClass.Q1_DIRECT_PIVOT:
+            raise ValueError("pivot precheck requires Q1 query")
+        if query.query_hash != precheck.query_hash:
+            raise ValueError("pivot precheck query hash mismatch")
+        if not set(precheck.assertion_ids) <= set(query.source_assertion_ids):
+            raise ValueError("pivot precheck assertions are not query provenance")
+        payload = self._model_payload(precheck)
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM pivot_prechecks WHERE precheck_id=?",
+                (precheck.precheck_id,),
+            ).fetchone()
+            if row:
+                if row[0] != payload:
+                    raise ValueError("pivot precheck immutable ID collision")
+                return False
+            connection.execute(
+                "INSERT INTO pivot_prechecks VALUES (?, ?, ?, ?, ?)",
+                (precheck.precheck_id, precheck.query_id, precheck.node_id,
+                 precheck.cutoff_at.isoformat(), payload),
+            )
+        return True
+
+    def register_pivot_precheck_result(
+        self, result: PivotPrecheckResultRecord
+    ) -> bool:
+        payload = self._model_payload(result)
+        with self.connect() as connection:
+            precheck_row = connection.execute(
+                "SELECT payload_json FROM pivot_prechecks WHERE precheck_id=?", (result.precheck_id,)
+            ).fetchone()
+            if precheck_row is None:
+                raise ValueError("precheck result references unknown definition")
+            if result.status in {PrecheckStatus.COMPLETE, PrecheckStatus.PARTIAL_MAX_PAGES}:
+                precheck = PivotPrecheckRecord.model_validate_json(precheck_row[0])
+                execution = connection.execute(
+                    "SELECT * FROM query_executions WHERE query_run_id=?",
+                    (result.collection_run_id,),
+                ).fetchone()
+                if execution is None:
+                    raise ValueError("precheck result lacks collection execution provenance")
+                if (
+                    execution["query_id"] != precheck.query_id
+                    or execution["cutoff_time"] != precheck.cutoff_at.isoformat()
+                    or execution["status"] != result.status.value
+                    or execution["result_count"] != result.hit_count
+                    or execution["result_manifest_hash"] != result.raw_manifest_hash
+                ):
+                    raise ValueError("precheck result does not match collection execution")
+            existing = connection.execute(
+                "SELECT payload_json FROM pivot_precheck_results WHERE result_id=?",
+                (result.result_id,),
+            ).fetchone()
+            if existing:
+                if existing[0] != payload:
+                    raise ValueError("precheck result immutable ID collision")
+                return False
+            previous = connection.execute(
+                "SELECT payload_json FROM pivot_precheck_results WHERE precheck_id=? "
+                "ORDER BY recorded_at DESC LIMIT 1", (result.precheck_id,),
+            ).fetchone()
+            if previous:
+                prior = PivotPrecheckResultRecord.model_validate_json(previous[0])
+                if prior.status is PrecheckStatus.COMPLETE:
+                    raise ValueError("complete precheck is terminal")
+                if result.page_count < prior.page_count or result.hit_count < prior.hit_count:
+                    raise ValueError("resumed precheck counters cannot decrease")
+                if result.recorded_at < prior.recorded_at:
+                    raise ValueError("precheck result history is out of order")
+            connection.execute(
+                "INSERT INTO pivot_precheck_results VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (result.result_id, result.precheck_id, result.status.value,
+                 result.page_count, result.hit_count, result.recorded_at.isoformat(), payload),
+            )
+        return True
+
+    def register_pivot_eligibility_review(
+        self, review: PivotEligibilityReviewRecord
+    ) -> bool:
+        from src.cti.pivot_precheck import precheck_eligibility
+
+        payload = self._model_payload(review)
+        with self.connect() as connection:
+            precheck_row = connection.execute(
+                "SELECT payload_json FROM pivot_prechecks WHERE precheck_id=?",
+                (review.precheck_id,),
+            ).fetchone()
+            result_row = connection.execute(
+                "SELECT payload_json FROM pivot_precheck_results WHERE precheck_id=? "
+                "ORDER BY recorded_at DESC LIMIT 1", (review.precheck_id,),
+            ).fetchone()
+            if precheck_row is None or result_row is None:
+                raise ValueError("eligibility review lacks precheck result")
+            precheck = PivotPrecheckRecord.model_validate_json(precheck_row[0])
+            result = PivotPrecheckResultRecord.model_validate_json(result_row[0])
+            if review.reviewed_at < result.recorded_at:
+                raise ValueError("eligibility review predates precheck result")
+            if review.decision.value == "accepted":
+                eligible, reason = precheck_eligibility(precheck, result, review)
+                if not eligible:
+                    raise ValueError("accepted eligibility review is invalid: " + reason)
+            existing = connection.execute(
+                "SELECT payload_json FROM pivot_eligibility_reviews WHERE precheck_id=?",
+                (review.precheck_id,),
+            ).fetchone()
+            if existing:
+                if existing[0] != payload:
+                    raise ValueError("precheck already has immutable eligibility review")
+                return False
+            connection.execute(
+                "INSERT INTO pivot_eligibility_reviews VALUES (?, ?, ?, ?, ?)",
+                (review.review_id, review.precheck_id, review.decision.value,
+                 review.reviewed_at.isoformat(), payload),
+            )
+        return True
+
+    def eligible_q2_precheck_ids(self) -> list[str]:
+        from src.cti.pivot_precheck import precheck_eligibility
+
+        output: list[str] = []
+        with self.connect() as connection:
+            prechecks = connection.execute(
+                "SELECT precheck_id, payload_json FROM pivot_prechecks"
+            ).fetchall()
+            for precheck_id, payload in prechecks:
+                result_row = connection.execute(
+                    "SELECT payload_json FROM pivot_precheck_results WHERE precheck_id=? "
+                    "ORDER BY recorded_at DESC LIMIT 1", (precheck_id,),
+                ).fetchone()
+                review_row = connection.execute(
+                    "SELECT payload_json FROM pivot_eligibility_reviews WHERE precheck_id=?",
+                    (precheck_id,),
+                ).fetchone()
+                if result_row is None:
+                    continue
+                precheck = PivotPrecheckRecord.model_validate_json(payload)
+                result = PivotPrecheckResultRecord.model_validate_json(result_row[0])
+                review = (PivotEligibilityReviewRecord.model_validate_json(review_row[0])
+                          if review_row else None)
+                if precheck_eligibility(precheck, result, review)[0]:
+                    output.append(precheck_id)
+        return sorted(output)
+
+    def phase_b_gate_report(self) -> dict:
+        """Audit persisted Phase B timelines, state histories, and eligibility gates."""
+
+        issues: list[dict[str, str]] = []
+        specs = (
+            ("q0_landmarks", "landmark_id", Q0LandmarkRecord),
+            ("q0_timeline_entries", "timeline_entry_id", Q0TimelineEntryRecord),
+            ("continuity_assessments", "assessment_id", ContinuityAssessmentRecord),
+            ("continuity_reviews", "review_id", ContinuityReviewRecord),
+            ("cti_composites", "composite_id", CtiCompositeRecord),
+            ("pivot_prechecks", "precheck_id", PivotPrecheckRecord),
+            ("pivot_precheck_results", "result_id", PivotPrecheckResultRecord),
+            ("pivot_eligibility_reviews", "review_id", PivotEligibilityReviewRecord),
+        )
+        counts: dict[str, int] = {}
+        with self.connect() as connection:
+            for table, key_column, model in specs:
+                rows = connection.execute(
+                    f"SELECT {key_column}, payload_json FROM {table}"
+                ).fetchall()
+                counts[table] = len(rows)
+                for key, payload in rows:
+                    try:
+                        model.model_validate_json(payload)
+                    except Exception as error:
+                        issues.append({
+                            "code": f"invalid_{table}", "record_id": key,
+                            "detail": str(error),
+                        })
+            q0_queries = connection.execute(
+                "SELECT query_id FROM query_registry WHERE query_class='Q0_SEED'"
+            ).fetchall()
+            for (query_id,) in q0_queries:
+                if connection.execute(
+                    "SELECT 1 FROM q0_landmarks WHERE query_id=?", (query_id,)
+                ).fetchone() is None:
+                    issues.append({"code": "q0_query_lacks_landmark",
+                                   "record_id": query_id, "detail": "Q0_SEED"})
+            accepted_prechecks = connection.execute(
+                "SELECT precheck_id FROM pivot_eligibility_reviews WHERE decision='accepted'"
+            ).fetchall()
+            q2_rows = connection.execute(
+                "SELECT query_id, source_precheck_ids_json FROM query_registry "
+                "WHERE query_class='Q2_DERIVED'"
+            ).fetchall()
+        eligible = set(self.eligible_q2_precheck_ids())
+        for (precheck_id,) in accepted_prechecks:
+            if precheck_id not in eligible:
+                issues.append({"code": "accepted_precheck_not_eligible",
+                               "record_id": precheck_id, "detail": "Q2 source blocked"})
+        for query_id, source_ids_json in q2_rows:
+            source_ids = set(json.loads(source_ids_json))
+            if not source_ids:
+                issues.append({"code": "q2_lacks_precheck_provenance",
+                               "record_id": query_id, "detail": "Q2 source blocked"})
+            elif not source_ids <= eligible:
+                issues.append({"code": "q2_has_ineligible_precheck",
+                               "record_id": query_id,
+                               "detail": ",".join(sorted(source_ids - eligible))})
+        counts["eligible_q2_prechecks"] = len(eligible)
+        return {"passed": not issues, "counts": counts, "issues": issues}
+
     def _transition(self, query_id: str, target: QueryStatus) -> QueryRecord:
         current = self.get_query(query_id)
         validate_transition(current.status, target)
@@ -513,6 +1090,7 @@ class QueryRegistry:
                 if row["source_available_at"] else None
             ),
             source_feature_ids=json.loads(row["source_feature_ids_json"]),
+            source_precheck_ids=json.loads(row["source_precheck_ids_json"]),
             developed_from_split=DatasetSplit(row["developed_from_split"]),
             registered_at=datetime.fromisoformat(row["registered_at"]),
             frozen_at=datetime.fromisoformat(row["frozen_at"]) if row["frozen_at"] else None,

@@ -30,6 +30,7 @@ from src.censys.paginated_collection import (
 from src.censys.q0_seed import register_q0_seed
 from src.censys.query_lifecycle import ensure_execution_allowed
 from src.censys.query_registry import QueryRegistry
+from src.censys.continuity import assess_continuity, materialize_q0_timeline
 from src.models import DatasetSplit, QueryClass, QueryExecutionRecord
 from src.cti.brave_search import BraveProtocolSearchBackend
 from src.cti.corpus_registry import CorpusRegistry
@@ -42,6 +43,7 @@ from src.cti.ioc_extraction import (
     verify_indicator_candidates,
 )
 from src.cti.pivot_planning import register_pivot_plans
+from src.cti.pivot_precheck import build_cti_only_composite, register_precheck_definition
 from src.cti.search_execution import (
     SearchCandidate,
     SearchExecutionResult,
@@ -70,6 +72,10 @@ from src.models import (
     SourceRelationshipRecord,
     SourceAccessClass,
     TimePrecision,
+    ContinuityReviewRecord,
+    PivotEligibilityReviewRecord,
+    PivotPrecheckResultRecord,
+    Q0LandmarkRecord,
 )
 from src.provenance import sha256_file, sha256_text
 
@@ -218,33 +224,7 @@ def _record_execution_idempotent(
 ) -> bool:
     """동일 execution ledger가 이미 있으면 검증 후 no-op으로 처리한다."""
 
-    with registry.connect() as connection:
-        row = connection.execute(
-            "SELECT * FROM query_executions WHERE query_run_id = ?",
-            (execution.query_run_id,),
-        ).fetchone()
-    if row is None:
-        registry.record_execution(execution)
-        return False
-    expected = {
-        "query_id": execution.query_id,
-        "query_hash": execution.query_hash,
-        "cutoff_time": execution.cutoff_time.isoformat(),
-        "executed_at": execution.executed_at.isoformat(),
-        "dataset_split": execution.dataset_split.value,
-        "result_count": execution.result_count,
-        "result_manifest_hash": execution.result_manifest_hash,
-        "api_schema_version": execution.api_schema_version,
-        "status": execution.status,
-        "failure_reason": execution.failure_reason,
-    }
-    mismatched = [key for key, value in expected.items() if row[key] != value]
-    if mismatched:
-        raise ValueError(
-            "query_run_id already exists with different execution content: "
-            + ", ".join(mismatched)
-        )
-    return True
+    return not registry.record_execution(execution)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -454,6 +434,75 @@ def build_parser() -> argparse.ArgumentParser:
     )
     phase_a_audit.add_argument("--db", type=Path, required=True)
     phase_a_audit.add_argument("--out", type=Path, required=True)
+
+    q0_assess = subparsers.add_parser(
+        "q0-assess-continuity", help="materialize a Q0 landmark timeline and assess continuity"
+    )
+    q0_assess.add_argument("--db", type=Path, required=True)
+    q0_assess.add_argument("--landmark", type=Path, required=True)
+    q0_assess.add_argument("--assessed-at", type=_datetime, required=True)
+    q0_assess.add_argument("--contradiction-observation-id", action="append", default=[])
+    q0_assess.add_argument("--out", type=Path, required=True)
+
+    continuity_review = subparsers.add_parser(
+        "q0-review-continuity", help="persist an immutable continuity review"
+    )
+    continuity_review.add_argument("--db", type=Path, required=True)
+    continuity_review.add_argument("--review", type=Path, required=True)
+    continuity_review.add_argument("--out", type=Path, required=True)
+
+    composite = subparsers.add_parser(
+        "cti-register-composite", help="register a same-node, same-window CTI-only composite"
+    )
+    composite.add_argument("--db", type=Path, required=True)
+    composite.add_argument("--accepted-assertions", type=Path, required=True)
+    composite.add_argument("--node-id", required=True)
+    composite.add_argument("--window-start", type=_datetime, required=True)
+    composite.add_argument("--window-end", type=_datetime, required=True)
+    composite.add_argument("--out", type=Path, required=True)
+
+    precheck = subparsers.add_parser(
+        "cti-register-precheck", help="register a bounded Q1 singleton/composite precheck"
+    )
+    precheck.add_argument("--db", type=Path, required=True)
+    precheck.add_argument("--query-id", required=True)
+    precheck.add_argument("--accepted-assertions", type=Path, required=True)
+    precheck.add_argument("--node-id", required=True)
+    precheck.add_argument("--cutoff-at", type=_datetime, required=True)
+    precheck.add_argument("--page-budget", type=int, required=True)
+    precheck.add_argument("--registered-at", type=_datetime, required=True)
+    precheck.add_argument("--risk-flag", action="append", default=[])
+    precheck.add_argument("--out", type=Path, required=True)
+
+    precheck_result = subparsers.add_parser(
+        "cti-record-precheck-result", help="persist a pending/partial/complete/failed precheck result"
+    )
+    precheck_result.add_argument("--db", type=Path, required=True)
+    precheck_result.add_argument("--result", type=Path, required=True)
+    precheck_result.add_argument("--out", type=Path, required=True)
+
+    precheck_review = subparsers.add_parser(
+        "cti-review-precheck", help="persist immutable human Q2 eligibility review"
+    )
+    precheck_review.add_argument("--db", type=Path, required=True)
+    precheck_review.add_argument("--review", type=Path, required=True)
+    precheck_review.add_argument("--out", type=Path, required=True)
+
+    q2 = subparsers.add_parser(
+        "register-q2", help="register Q2 only from eligible reviewed prechecks"
+    )
+    q2.add_argument("--db", type=Path, required=True)
+    q2.add_argument("--version", required=True)
+    q2.add_argument("--query-text", required=True)
+    q2.add_argument("--precheck-id", action="append", required=True)
+    q2.add_argument("--config-hash", required=True)
+    q2.add_argument("--registered-at", type=_datetime, required=True)
+
+    phase_b_audit = subparsers.add_parser(
+        "cti-audit-phase-b", help="audit Stage 2/3 continuity and Q2 eligibility gates"
+    )
+    phase_b_audit.add_argument("--db", type=Path, required=True)
+    phase_b_audit.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -701,6 +750,86 @@ def main(argv: list[str] | None = None) -> int:
         if not report["passed"]:
             raise RuntimeError("Phase A audit failed; inspect the report issues")
         return 0
+    if args.command == "q0-assess-continuity":
+        registry = QueryRegistry(args.db)
+        landmark = Q0LandmarkRecord.model_validate(_load_json(args.landmark))
+        registry.register_q0_landmark(landmark)
+        hosts, services = registry.load_indicator_observations(landmark.indicator_id)
+        timeline = list(materialize_q0_timeline(landmark, hosts, services))
+        registry.register_q0_timeline(timeline)
+        assessment = assess_continuity(
+            landmark, timeline, assessed_at=args.assessed_at,
+            explicit_contradiction_observation_ids=args.contradiction_observation_id,
+        )
+        registry.register_continuity_assessment(assessment)
+        payload = {
+            "landmark": landmark.model_dump(mode="json"),
+            "timeline": [item.model_dump(mode="json") for item in timeline],
+            "assessment": assessment.model_dump(mode="json"),
+        }
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "q0-review-continuity":
+        registry = QueryRegistry(args.db)
+        review = ContinuityReviewRecord.model_validate(_load_json(args.review))
+        inserted = registry.register_continuity_review(review)
+        payload = {"review": review.model_dump(mode="json"), "inserted": inserted}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command in {"cti-register-composite", "cti-register-precheck"}:
+        assertion_ids = _load_json(args.accepted_assertions)
+        if not isinstance(assertion_ids, list) or not all(
+            isinstance(item, str) for item in assertion_ids
+        ):
+            raise ValueError("accepted assertions manifest must be a JSON string array")
+        cutoff = args.window_end if args.command == "cti-register-composite" else args.cutoff_at
+        sources = CorpusRegistry(args.db).accepted_pivot_sources(
+            assertion_ids, cutoff_at=cutoff
+        )
+        registry = QueryRegistry(args.db)
+        if args.command == "cti-register-composite":
+            record = build_cti_only_composite(
+                sources, node_id=args.node_id, window_start=args.window_start,
+                window_end=args.window_end,
+            )
+            inserted = registry.register_cti_composite(record)
+        else:
+            record = register_precheck_definition(
+                registry.get_query(args.query_id), sources, node_id=args.node_id,
+                cutoff_at=args.cutoff_at, page_budget=args.page_budget,
+                registered_at=args.registered_at, risk_flags=args.risk_flag,
+            )
+            inserted = registry.register_pivot_precheck(record)
+        payload = {"record": record.model_dump(mode="json"), "inserted": inserted}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "cti-record-precheck-result":
+        registry = QueryRegistry(args.db)
+        result = PivotPrecheckResultRecord.model_validate(_load_json(args.result))
+        registry.get_pivot_precheck(result.precheck_id)
+        inserted = registry.register_pivot_precheck_result(result)
+        payload = {"result": result.model_dump(mode="json"), "inserted": inserted}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "cti-review-precheck":
+        registry = QueryRegistry(args.db)
+        review = PivotEligibilityReviewRecord.model_validate(_load_json(args.review))
+        inserted = registry.register_pivot_eligibility_review(review)
+        payload = {"review": review.model_dump(mode="json"), "inserted": inserted}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "cti-audit-phase-b":
+        report = QueryRegistry(args.db).phase_b_gate_report()
+        write_immutable_json(args.out, report)
+        print(json.dumps(report, ensure_ascii=False))
+        if not report["passed"]:
+            raise RuntimeError("Phase B audit failed; inspect the report issues")
+        return 0
     if args.command == "normalize-censys":
         registry = QueryRegistry(args.db)
         execution = registry.get_execution(args.query_run_id)
@@ -795,9 +924,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "register-query":
         query_class = QueryClass(args.query_class)
-        if query_class in {QueryClass.Q0_SEED, QueryClass.Q1_DIRECT_PIVOT}:
+        if query_class in {QueryClass.Q0_SEED, QueryClass.Q1_DIRECT_PIVOT, QueryClass.Q2_DERIVED}:
             raise ValueError(
-                "Q0/Q1 registration requires the accepted assertion workflow"
+                "Q0/Q1/Q2 registration requires its provenance-gated workflow"
             )
         record = registry.register_query(
             query_version=args.version,
@@ -807,6 +936,12 @@ def main(argv: list[str] | None = None) -> int:
             config_hash=args.config_hash,
             source_indicator_ids=args.source_indicator_id,
             source_feature_ids=args.source_feature_id,
+        )
+    elif args.command == "register-q2":
+        record = registry.register_q2_from_prechecks(
+            query_version=args.version, query_text=args.query_text,
+            precheck_ids=args.precheck_id, config_hash=args.config_hash,
+            registered_at=args.registered_at,
         )
     elif args.command == "validate-query":
         record = registry.mark_validated(args.query_id)
