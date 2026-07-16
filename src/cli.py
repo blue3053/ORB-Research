@@ -31,6 +31,17 @@ from src.censys.q0_seed import register_q0_seed
 from src.censys.query_lifecycle import ensure_execution_allowed
 from src.censys.query_registry import QueryRegistry
 from src.censys.continuity import assess_continuity, materialize_q0_timeline
+from src.censys.feature_registry import FeatureRegistry
+from src.censys.features import build_entity_epochs, extract_observation_features
+from src.censys.background import (
+    assess_feature_eligibility,
+    compute_feature_stat_snapshot,
+    materialize_reference_memberships,
+)
+from src.censys.query_composer import build_query_design, render_query
+from src.censys.query_freeze import QueryDesignRegistry, build_budget_schedule
+from src.prospective.registry import ProspectiveRegistry
+from src.prospective.scheduler import materialize_due_opportunities
 from src.models import DatasetSplit, QueryClass, QueryExecutionRecord
 from src.cti.brave_search import BraveProtocolSearchBackend
 from src.cti.corpus_registry import CorpusRegistry
@@ -76,6 +87,20 @@ from src.models import (
     PivotEligibilityReviewRecord,
     PivotPrecheckResultRecord,
     Q0LandmarkRecord,
+    FeatureEligibilityReviewRecord,
+    ReferenceSetRecord,
+    QueryBudgetScheduleRecord,
+    QueryClauseRecord,
+    QueryCompositionType,
+    QueryDesignPrecheckRecord,
+    QueryDesignReviewRecord,
+    CandidateAdjudicationRecord,
+    CandidateEvidenceRecord,
+    CandidateGradeEventRecord,
+    CandidateRecord,
+    EntityEpochRecord,
+    ProspectiveObservationEventRecord,
+    QueryFreezeManifestRecord,
 )
 from src.provenance import sha256_file, sha256_text
 
@@ -237,6 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     register = subparsers.add_parser("register-query", help="register an immutable Q0-Q3 query")
     register.add_argument("--db", type=Path, required=True)
     register.add_argument("--version", required=True)
+    register.add_argument("--variant", default="primary")
     register.add_argument("--class", dest="query_class", choices=[v.value for v in QueryClass], required=True)
     register.add_argument("--query-text", required=True)
     register.add_argument("--split", choices=[v.value for v in DatasetSplit], required=True)
@@ -493,6 +519,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     q2.add_argument("--db", type=Path, required=True)
     q2.add_argument("--version", required=True)
+    q2.add_argument("--variant", default="primary")
     q2.add_argument("--query-text", required=True)
     q2.add_argument("--precheck-id", action="append", required=True)
     q2.add_argument("--config-hash", required=True)
@@ -503,6 +530,165 @@ def build_parser() -> argparse.ArgumentParser:
     )
     phase_b_audit.add_argument("--db", type=Path, required=True)
     phase_b_audit.add_argument("--out", type=Path, required=True)
+
+    feature_build = subparsers.add_parser(
+        "feature-build", help="extract deterministic features and entity epochs from eligible runs"
+    )
+    feature_build.add_argument("--db", type=Path, required=True)
+    feature_build.add_argument("--query-run-id", action="append", required=True)
+    feature_build.add_argument("--source-eligibility-id", action="append", required=True)
+    feature_build.add_argument("--extractor-version", default="feature-v1")
+    feature_build.add_argument("--resolution-version", default="entity-resolution-v1")
+    feature_build.add_argument("--out", type=Path, required=True)
+
+    background_build = subparsers.add_parser(
+        "feature-build-background", help="materialize a cutoff-matched reference snapshot"
+    )
+    background_build.add_argument("--db", type=Path, required=True)
+    background_build.add_argument("--reference", type=Path, required=True)
+    background_build.add_argument("--query-run-id", action="append", required=True)
+    background_build.add_argument("--out", type=Path, required=True)
+
+    feature_assess = subparsers.add_parser(
+        "feature-assess", help="compute reproducible statistics and eligibility candidate status"
+    )
+    feature_assess.add_argument("--db", type=Path, required=True)
+    feature_assess.add_argument("--feature-id", required=True)
+    feature_assess.add_argument("--reference-set-id", required=True)
+    feature_assess.add_argument("--anchor-observation-id", action="append", required=True)
+    feature_assess.add_argument("--anchor-source-id", action="append", required=True)
+    feature_assess.add_argument("--computed-at", type=_datetime, required=True)
+    feature_assess.add_argument("--min-distinct-anchors", type=int, default=2)
+    feature_assess.add_argument("--min-anchor-support", type=float, default=0.5)
+    feature_assess.add_argument("--max-background-prevalence", type=float, default=0.1)
+    feature_assess.add_argument("--out", type=Path, required=True)
+
+    feature_review = subparsers.add_parser(
+        "feature-review", help="persist immutable human feature eligibility review"
+    )
+    feature_review.add_argument("--db", type=Path, required=True)
+    feature_review.add_argument("--review", type=Path, required=True)
+    feature_review.add_argument("--out", type=Path, required=True)
+
+    phase_c_audit = subparsers.add_parser(
+        "cti-audit-phase-c", help="audit feature/background/cutoff/source reproducibility gates"
+    )
+    phase_c_audit.add_argument("--db", type=Path, required=True)
+    phase_c_audit.add_argument("--out", type=Path, required=True)
+
+    compose = subparsers.add_parser(
+        "query-compose", help="compose and register a provenance-gated Q2/Q3 design"
+    )
+    compose.add_argument("--db", type=Path, required=True)
+    compose.add_argument("--clauses", type=Path, required=True)
+    compose.add_argument("--version", required=True)
+    compose.add_argument("--variant", default="primary")
+    compose.add_argument("--class", dest="query_class", choices=[
+        QueryClass.Q2_DERIVED.value, QueryClass.Q3_CLUSTER.value
+    ], required=True)
+    compose.add_argument("--composition", choices=[
+        item.value for item in QueryCompositionType
+    ], required=True)
+    compose.add_argument("--cutoff-at", type=_datetime, required=True)
+    compose.add_argument("--registered-at", type=_datetime, required=True)
+    compose.add_argument("--config-hash", required=True)
+    compose.add_argument("--source-indicator-id", action="append", default=[])
+    compose.add_argument("--background-snapshot-id", action="append", default=[])
+    compose.add_argument("--api-schema-version", required=True)
+    compose.add_argument("--parser-version", required=True)
+    compose.add_argument("--normalizer-version", required=True)
+    compose.add_argument("--entity-resolution-version", required=True)
+    compose.add_argument("--out", type=Path, required=True)
+
+    schedule = subparsers.add_parser(
+        "query-register-schedule", help="register immutable query budget and schedule"
+    )
+    schedule.add_argument("--db", type=Path, required=True)
+    schedule.add_argument("--design-id", required=True)
+    schedule.add_argument("--interval-hours", type=int, required=True)
+    schedule.add_argument("--starts-at", type=_datetime, required=True)
+    schedule.add_argument("--max-alerts-per-run", type=int, required=True)
+    schedule.add_argument("--max-credits-per-run", type=float, required=True)
+    schedule.add_argument("--max-pages-per-run", type=int, required=True)
+    schedule.add_argument("--tie-break-rule", required=True)
+    schedule.add_argument("--registered-at", type=_datetime, required=True)
+    schedule.add_argument("--out", type=Path, required=True)
+
+    design_precheck = subparsers.add_parser(
+        "query-record-precheck", help="record bounded development precheck state"
+    )
+    design_precheck.add_argument("--db", type=Path, required=True)
+    design_precheck.add_argument("--precheck", type=Path, required=True)
+    design_precheck.add_argument("--out", type=Path, required=True)
+
+    design_review = subparsers.add_parser(
+        "query-review", help="persist immutable human query design review"
+    )
+    design_review.add_argument("--db", type=Path, required=True)
+    design_review.add_argument("--review", type=Path, required=True)
+    design_review.add_argument("--out", type=Path, required=True)
+
+    designed_freeze = subparsers.add_parser(
+        "query-freeze-designed", help="freeze a reviewed design and immutable schedule"
+    )
+    designed_freeze.add_argument("--db", type=Path, required=True)
+    designed_freeze.add_argument("--design-id", required=True)
+    designed_freeze.add_argument("--frozen-at", type=_datetime, required=True)
+    designed_freeze.add_argument("--valid-for-test-from", type=_datetime, required=True)
+    designed_freeze.add_argument("--out", type=Path, required=True)
+
+    phase_d_audit = subparsers.add_parser(
+        "cti-audit-phase-d", help="audit query composition, review, budget, and freeze gates"
+    )
+    phase_d_audit.add_argument("--db", type=Path, required=True)
+    phase_d_audit.add_argument("--out", type=Path, required=True)
+
+    phase_e_schedule = subparsers.add_parser(
+        "phase-e-schedule", help="materialize due prospective opportunities offline"
+    )
+    phase_e_schedule.add_argument("--db", type=Path, required=True)
+    phase_e_schedule.add_argument("--query-id", required=True)
+    phase_e_schedule.add_argument("--freeze", type=Path, required=True)
+    phase_e_schedule.add_argument("--schedule", type=Path, required=True)
+    phase_e_schedule.add_argument("--epochs", type=Path, required=True)
+    phase_e_schedule.add_argument("--as-of", type=_datetime, required=True)
+    phase_e_schedule.add_argument("--recorded-at", type=_datetime, required=True)
+    phase_e_schedule.add_argument("--out", type=Path, required=True)
+
+    phase_e_event = subparsers.add_parser(
+        "phase-e-register-event", help="persist a prospective event and optional candidate"
+    )
+    phase_e_event.add_argument("--db", type=Path, required=True)
+    phase_e_event.add_argument("--event", type=Path, required=True)
+    phase_e_event.add_argument("--candidate", type=Path)
+    phase_e_event.add_argument("--out", type=Path, required=True)
+
+    phase_e_evidence = subparsers.add_parser(
+        "phase-e-register-evidence", help="persist independent candidate evidence"
+    )
+    phase_e_evidence.add_argument("--db", type=Path, required=True)
+    phase_e_evidence.add_argument("--evidence", type=Path, required=True)
+    phase_e_evidence.add_argument("--out", type=Path, required=True)
+
+    phase_e_adjudicate = subparsers.add_parser(
+        "phase-e-adjudicate", help="persist an independent human candidate adjudication"
+    )
+    phase_e_adjudicate.add_argument("--db", type=Path, required=True)
+    phase_e_adjudicate.add_argument("--adjudication", type=Path, required=True)
+    phase_e_adjudicate.add_argument("--out", type=Path, required=True)
+
+    phase_e_grade = subparsers.add_parser(
+        "phase-e-grade", help="append a candidate grade history event"
+    )
+    phase_e_grade.add_argument("--db", type=Path, required=True)
+    phase_e_grade.add_argument("--grade", type=Path, required=True)
+    phase_e_grade.add_argument("--out", type=Path, required=True)
+
+    phase_e_audit = subparsers.add_parser(
+        "cti-audit-phase-e", help="audit prospective and independent-evidence gates"
+    )
+    phase_e_audit.add_argument("--db", type=Path, required=True)
+    phase_e_audit.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -830,6 +1016,302 @@ def main(argv: list[str] | None = None) -> int:
         if not report["passed"]:
             raise RuntimeError("Phase B audit failed; inspect the report issues")
         return 0
+    if args.command == "feature-build":
+        query_registry = QueryRegistry(args.db)
+        feature_registry = FeatureRegistry(args.db)
+        authorized_runs = feature_registry.eligible_observation_run_ids(
+            args.source_eligibility_id
+        )
+        requested_runs = set(args.query_run_id)
+        if not requested_runs <= authorized_runs:
+            raise ValueError(
+                "feature runs are not covered by eligible Q0/Q1 decisions: "
+                + ", ".join(sorted(requested_runs - authorized_runs))
+            )
+        hosts, services = [], []
+        for query_run_id in sorted(requested_runs):
+            execution = query_registry.get_execution(query_run_id)
+            if execution.status != "complete":
+                raise ValueError("only complete eligible executions can produce features")
+            run_hosts, run_services = query_registry.load_observations(query_run_id)
+            hosts.extend(run_hosts)
+            services.extend(run_services)
+        batch = extract_observation_features(
+            hosts, services, extractor_version=args.extractor_version
+        )
+        effects = feature_registry.register_feature_batch(
+            list(batch.features), list(batch.observations)
+        )
+        epochs = build_entity_epochs(
+            hosts, list(batch.observations), list(batch.features),
+            resolution_version=args.resolution_version,
+        )
+        epoch_count = feature_registry.register_entity_epochs(list(epochs))
+        payload = {
+            "feature_ids": [item.feature_id for item in batch.features],
+            "feature_observation_ids": [item.feature_observation_id for item in batch.observations],
+            "entity_epoch_ids": [item.entity_epoch_id for item in epochs],
+            "source_eligibility_ids": sorted(set(args.source_eligibility_id)),
+            "database_effects": {**effects, "epochs_inserted": epoch_count},
+        }
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "feature-build-background":
+        query_registry = QueryRegistry(args.db)
+        feature_registry = FeatureRegistry(args.db)
+        reference = ReferenceSetRecord.model_validate(_load_json(args.reference))
+        if set(args.query_run_id) != set(reference.source_query_run_ids):
+            raise ValueError("background CLI runs must match reference snapshot source runs")
+        hosts, services = [], []
+        for query_run_id in sorted(set(args.query_run_id)):
+            execution = query_registry.get_execution(query_run_id)
+            if execution.status != "complete":
+                raise ValueError("background requires complete collection executions")
+            run_hosts, run_services = query_registry.load_observations(query_run_id)
+            hosts.extend(run_hosts)
+            services.extend(run_services)
+        memberships = materialize_reference_memberships(reference, hosts, services)
+        reference_inserted = feature_registry.register_reference_set(reference)
+        membership_count = feature_registry.register_reference_memberships(list(memberships))
+        payload = {
+            "reference_set": reference.model_dump(mode="json"),
+            "membership_ids": [item.membership_id for item in memberships],
+            "observable_denominator": sum(item.observable for item in memberships),
+            "database_effects": {
+                "reference_inserted": reference_inserted,
+                "memberships_inserted": membership_count,
+            },
+        }
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "feature-assess":
+        feature_registry = FeatureRegistry(args.db)
+        feature = feature_registry.get_feature(args.feature_id)
+        reference = feature_registry.get_reference_set(args.reference_set_id)
+        snapshot = compute_feature_stat_snapshot(
+            feature, reference,
+            feature_registry.load_reference_memberships(args.reference_set_id),
+            feature_registry.load_feature_observations(args.feature_id),
+            anchor_observation_ids=args.anchor_observation_id,
+            anchor_source_ids=args.anchor_source_id,
+            computed_at=args.computed_at,
+        )
+        feature_registry.register_stat_snapshot(snapshot)
+        assessment = assess_feature_eligibility(
+            feature, snapshot, assessed_at=args.computed_at,
+            min_distinct_anchors=args.min_distinct_anchors,
+            min_anchor_support=args.min_anchor_support,
+            max_background_prevalence=args.max_background_prevalence,
+        )
+        feature_registry.register_eligibility_assessment(assessment)
+        payload = {
+            "stat_snapshot": snapshot.model_dump(mode="json"),
+            "eligibility_assessment": assessment.model_dump(mode="json"),
+            "query_eligible": False,
+            "human_review_required": assessment.status.value == "candidate",
+        }
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "feature-review":
+        feature_registry = FeatureRegistry(args.db)
+        review = FeatureEligibilityReviewRecord.model_validate(_load_json(args.review))
+        inserted = feature_registry.register_eligibility_review(review)
+        payload = {
+            "review": review.model_dump(mode="json"), "inserted": inserted,
+            "eligible_feature_ids": feature_registry.eligible_feature_ids(),
+        }
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "cti-audit-phase-c":
+        report = FeatureRegistry(args.db).phase_c_gate_report()
+        write_immutable_json(args.out, report)
+        print(json.dumps(report, ensure_ascii=False))
+        if not report["passed"]:
+            raise RuntimeError("Phase C audit failed; inspect the report issues")
+        return 0
+    if args.command == "query-compose":
+        raw_clauses = _load_json(args.clauses)
+        if not isinstance(raw_clauses, list):
+            raise ValueError("query clauses manifest must be a JSON array")
+        clauses = [QueryClauseRecord.model_validate(item) for item in raw_clauses]
+        query_registry = QueryRegistry(args.db)
+        design_registry = QueryDesignRegistry(args.db)
+        feature_registry = FeatureRegistry(args.db)
+        eligible_feature_ids = set(feature_registry.eligible_feature_ids())
+        feature_ids = sorted({
+            item.source_feature_id for item in clauses if item.source_feature_id
+        })
+        eligible_features = {
+            feature_id: feature_registry.get_feature(feature_id)
+            for feature_id in feature_ids if feature_id in eligible_feature_ids
+        }
+        precheck_ids = sorted({
+            item.source_precheck_id for item in clauses if item.source_precheck_id
+        })
+        assertion_ids = {
+            item.source_assertion_id for item in clauses if item.source_assertion_id
+        }
+        for precheck_id in precheck_ids:
+            assertion_ids.update(query_registry.get_pivot_precheck(precheck_id).assertion_ids)
+        query_class = QueryClass(args.query_class)
+        composition = QueryCompositionType(args.composition)
+        rendered = render_query(
+            clauses, composition_type=composition, query_class=query_class,
+            cutoff_at=args.cutoff_at,
+            accepted_assertion_ids=design_registry._accepted_assertion_ids(),
+            eligible_precheck_ids=set(query_registry.eligible_q2_precheck_ids()),
+            eligible_features=eligible_features,
+        )
+        record = query_registry.register_query(
+            query_version=args.version, query_variant=args.variant,
+            query_class=query_class, query_text=rendered,
+            developed_from_split=DatasetSplit.DEVELOPMENT,
+            config_hash=args.config_hash,
+            source_indicator_ids=args.source_indicator_id,
+            source_assertion_ids=sorted(assertion_ids),
+            source_available_at=max(item.available_at for item in clauses),
+            source_feature_ids=feature_ids, source_precheck_ids=precheck_ids,
+            registered_at=args.registered_at,
+        )
+        design = build_query_design(
+            record, clauses, variant=args.variant, composition_type=composition,
+            cutoff_at=args.cutoff_at,
+            background_snapshot_ids=args.background_snapshot_id,
+            api_schema_version=args.api_schema_version,
+            parser_version=args.parser_version,
+            normalizer_version=args.normalizer_version,
+            entity_resolution_version=args.entity_resolution_version,
+            registered_at=args.registered_at,
+        )
+        inserted = design_registry.register_design(design, clauses)
+        payload = {
+            "query": record.model_dump(mode="json"),
+            "design": design.model_dump(mode="json"),
+            "clause_ids": design.clause_ids, "inserted": inserted,
+        }
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "query-register-schedule":
+        registry = QueryDesignRegistry(args.db)
+        design = registry.get_design(args.design_id)
+        schedule = build_budget_schedule(
+            design, interval_hours=args.interval_hours, starts_at=args.starts_at,
+            max_alerts_per_run=args.max_alerts_per_run,
+            max_credits_per_run=args.max_credits_per_run,
+            max_pages_per_run=args.max_pages_per_run,
+            tie_break_rule=args.tie_break_rule, registered_at=args.registered_at,
+        )
+        inserted = registry.register_schedule(schedule)
+        payload = {"schedule": schedule.model_dump(mode="json"), "inserted": inserted}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "query-record-precheck":
+        registry = QueryDesignRegistry(args.db)
+        precheck = QueryDesignPrecheckRecord.model_validate(_load_json(args.precheck))
+        inserted = registry.register_precheck(precheck)
+        payload = {"precheck": precheck.model_dump(mode="json"), "inserted": inserted}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "query-review":
+        registry = QueryDesignRegistry(args.db)
+        review = QueryDesignReviewRecord.model_validate(_load_json(args.review))
+        inserted = registry.register_review(review)
+        payload = {"review": review.model_dump(mode="json"), "inserted": inserted}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "query-freeze-designed":
+        design_registry = QueryDesignRegistry(args.db)
+        design = design_registry.get_design(args.design_id)
+        manifest = design_registry.prepare_freeze_manifest(
+            args.design_id, frozen_at=args.frozen_at,
+            valid_for_test_from=args.valid_for_test_from,
+        )
+        design_registry.register_freeze_manifest(manifest)
+        query = QueryRegistry(args.db).freeze_query(
+            design.query_id, frozen_at=args.frozen_at,
+            valid_for_test_from=args.valid_for_test_from,
+        )
+        payload = {
+            "query": query.model_dump(mode="json"),
+            "freeze_manifest": manifest.model_dump(mode="json"),
+        }
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "cti-audit-phase-d":
+        report = QueryDesignRegistry(args.db).phase_d_gate_report()
+        write_immutable_json(args.out, report)
+        print(json.dumps(report, ensure_ascii=False))
+        if not report["passed"]:
+            raise RuntimeError("Phase D audit failed; inspect the report issues")
+        return 0
+    if args.command == "phase-e-schedule":
+        query = QueryRegistry(args.db).get_query(args.query_id)
+        freeze = QueryFreezeManifestRecord.model_validate(_load_json(args.freeze))
+        schedule = QueryBudgetScheduleRecord.model_validate(_load_json(args.schedule))
+        raw_epochs = _load_json(args.epochs)
+        if not isinstance(raw_epochs, list):
+            raise ValueError("entity epochs manifest must be a JSON array")
+        epochs = [EntityEpochRecord.model_validate(item) for item in raw_epochs]
+        opportunities = materialize_due_opportunities(
+            query, freeze, schedule, epochs, as_of=args.as_of, recorded_at=args.recorded_at
+        )
+        registry = ProspectiveRegistry(args.db)
+        inserted = sum(registry.record_opportunity(item) for item in opportunities)
+        payload = {"opportunities": [item.model_dump(mode="json") for item in opportunities],
+                   "inserted": inserted}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "phase-e-register-event":
+        registry = ProspectiveRegistry(args.db)
+        event = ProspectiveObservationEventRecord.model_validate(_load_json(args.event))
+        payload = {"event_inserted": registry.register_observation_event(event)}
+        if args.candidate:
+            candidate = CandidateRecord.model_validate(_load_json(args.candidate))
+            payload["candidate_inserted"] = registry.register_candidate(candidate)
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "phase-e-register-evidence":
+        registry = ProspectiveRegistry(args.db)
+        evidence = CandidateEvidenceRecord.model_validate(_load_json(args.evidence))
+        payload = {"evidence": evidence.model_dump(mode="json"),
+                   "inserted": registry.register_evidence(evidence)}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "phase-e-adjudicate":
+        registry = ProspectiveRegistry(args.db)
+        record = CandidateAdjudicationRecord.model_validate(_load_json(args.adjudication))
+        payload = {"adjudication": record.model_dump(mode="json"),
+                   "inserted": registry.register_adjudication(record)}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "phase-e-grade":
+        registry = ProspectiveRegistry(args.db)
+        record = CandidateGradeEventRecord.model_validate(_load_json(args.grade))
+        payload = {"grade_event": record.model_dump(mode="json"),
+                   "inserted": registry.register_grade_event(record)}
+        write_immutable_json(args.out, payload)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if args.command == "cti-audit-phase-e":
+        report = ProspectiveRegistry(args.db).phase_e_gate_report()
+        write_immutable_json(args.out, report)
+        print(json.dumps(report, ensure_ascii=False))
+        if not report["ok"]:
+            raise RuntimeError("Phase E audit failed; inspect the report issues")
+        return 0
     if args.command == "normalize-censys":
         registry = QueryRegistry(args.db)
         execution = registry.get_execution(args.query_run_id)
@@ -930,6 +1412,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         record = registry.register_query(
             query_version=args.version,
+            query_variant=args.variant,
             query_class=query_class,
             query_text=args.query_text,
             developed_from_split=DatasetSplit(args.split),
@@ -940,6 +1423,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "register-q2":
         record = registry.register_q2_from_prechecks(
             query_version=args.version, query_text=args.query_text,
+            query_variant=args.variant,
             precheck_ids=args.precheck_id, config_hash=args.config_hash,
             registered_at=args.registered_at,
         )

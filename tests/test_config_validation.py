@@ -65,6 +65,12 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(100, config.censys_collection.page_size)
         self.assertTrue(config.phase_b_policy.require_eligible_precheck_for_q2)
         self.assertEqual(2, config.phase_b_policy.precheck_page_budget)
+        self.assertTrue(config.background_policy.require_matched_background)
+        self.assertEqual(2, config.feature_eligibility.min_distinct_anchors)
+        self.assertTrue(config.query_freeze_policy.require_human_review)
+        self.assertFalse(
+            config.query_freeze_policy.performance_claim_allowed_in_precheck
+        )
 
     def test_rejects_unknown_and_unsafe_values(self):
         unknown = valid_config()

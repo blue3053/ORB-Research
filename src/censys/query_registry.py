@@ -47,6 +47,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS query_registry (
   query_id TEXT PRIMARY KEY,
   query_version TEXT NOT NULL,
+  query_variant TEXT NOT NULL DEFAULT 'primary',
   query_class TEXT NOT NULL,
   query_text TEXT NOT NULL,
   query_hash TEXT NOT NULL,
@@ -223,11 +224,17 @@ class QueryRegistry:
                 "ALTER TABLE query_registry ADD COLUMN source_precheck_ids_json "
                 "TEXT NOT NULL DEFAULT '[]'"
             )
+        if "query_variant" not in columns:
+            connection.execute(
+                "ALTER TABLE query_registry ADD COLUMN query_variant "
+                "TEXT NOT NULL DEFAULT 'primary'"
+            )
 
     def register_query(
         self,
         *,
         query_version: str,
+        query_variant: str = "primary",
         query_class: QueryClass,
         query_text: str,
         developed_from_split: DatasetSplit,
@@ -243,10 +250,13 @@ class QueryRegistry:
         if not query_text:
             raise ValueError("query_text cannot be empty")
         query_hash = sha256_text(query_text)
-        query_id = f"qry-{sha256_text('|'.join([query_class.value, query_version, query_hash]))[:16]}"
+        query_id = f"qry-{sha256_text('|'.join([
+            query_class.value, query_version, query_variant, query_hash
+        ]))[:16]}"
         record = QueryRecord(
             query_id=query_id,
             query_version=query_version,
+            query_variant=query_variant,
             query_class=query_class,
             query_text=query_text,
             query_hash=query_hash,
@@ -271,13 +281,14 @@ class QueryRegistry:
             connection.execute(
                 "INSERT INTO query_registry "
                 "(query_id, query_version, query_class, query_text, query_hash, "
+                "query_variant, "
                 "source_indicator_ids_json, source_assertion_ids_json, source_available_at, "
                 "source_feature_ids_json, source_precheck_ids_json, developed_from_split, registered_at, frozen_at, "
                 "valid_for_test_from, config_hash, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.query_id, record.query_version, record.query_class.value,
-                    record.query_text, record.query_hash,
+                    record.query_text, record.query_hash, record.query_variant,
                     json.dumps(record.source_indicator_ids, sort_keys=True),
                     json.dumps(record.source_assertion_ids, sort_keys=True),
                     (record.source_available_at.isoformat()
@@ -294,6 +305,7 @@ class QueryRegistry:
         self,
         *,
         query_version: str,
+        query_variant: str = "primary",
         query_text: str,
         precheck_ids: list[str],
         config_hash: str,
@@ -318,6 +330,7 @@ class QueryRegistry:
         source_available_at = max(item.source_available_at for item in prechecks)
         return self.register_query(
             query_version=query_version,
+            query_variant=query_variant,
             query_class=QueryClass.Q2_DERIVED,
             query_text=query_text,
             developed_from_split=DatasetSplit.DEVELOPMENT,
@@ -351,6 +364,12 @@ class QueryRegistry:
             raise ValueError("valid_for_test_from cannot predate frozen_at")
         current = self.get_query(query_id)
         self._require_cti_assertion_provenance(current)
+        if current.query_class in {QueryClass.Q2_DERIVED, QueryClass.Q3_CLUSTER}:
+            from src.censys.query_freeze import QueryDesignRegistry
+
+            QueryDesignRegistry(self.path).assert_freeze_ready(
+                query_id, frozen_at=frozen_at, valid_for_test_from=valid_for_test_from
+            )
         if current.source_available_at and current.source_available_at > frozen_at:
             raise ValueError("query source was not available by frozen_at")
         validate_transition(current.status, QueryStatus.FROZEN)
@@ -1081,6 +1100,7 @@ class QueryRegistry:
     def _row_to_query(row: sqlite3.Row) -> QueryRecord:
         return QueryRecord(
             query_id=row["query_id"], query_version=row["query_version"],
+            query_variant=row["query_variant"],
             query_class=QueryClass(row["query_class"]), query_text=row["query_text"],
             query_hash=row["query_hash"],
             source_indicator_ids=json.loads(row["source_indicator_ids_json"]),

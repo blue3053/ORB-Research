@@ -30,11 +30,13 @@ class QueryRegistryTests(unittest.TestCase):
     def _register(self):
         return self.registry.register_query(
             query_version="v1",
-            query_class=QueryClass.Q2_DERIVED,
-            query_text='host.services.port: 8443 and host.services.service_name: "HTTP"',
+            query_class=QueryClass.Q0_SEED,
+            query_text="192.0.2.1",
             developed_from_split=DatasetSplit.DEVELOPMENT,
             config_hash="config-hash",
-            source_feature_ids=["feature-1"],
+            source_indicator_ids=["ioc-seed"],
+            source_assertion_ids=["assert-seed"],
+            source_available_at=self.t0,
             registered_at=self.t0,
         )
 
@@ -134,6 +136,7 @@ class QueryRegistryTests(unittest.TestCase):
         self.assertIn("source_assertion_ids_json", columns)
         self.assertIn("source_available_at", columns)
         self.assertIn("source_precheck_ids_json", columns)
+        self.assertIn("query_variant", columns)
 
     def test_partial_execution_can_resume_under_same_run_id(self) -> None:
         query = self._register()

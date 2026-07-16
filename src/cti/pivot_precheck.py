@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING
 
-from src.censys.paginated_collection import CollectionResult
+if TYPE_CHECKING:
+    from src.censys.paginated_collection import CollectionResult
 from src.models import (
     AcceptedPivotSource,
     AssertionRole,

@@ -117,6 +117,44 @@ class PhaseBPolicyConfig(StrictConfigModel):
     require_eligible_precheck_for_q2: Literal[True] = True
 
 
+class BackgroundPolicyConfig(StrictConfigModel):
+    require_matched_background: Literal[True] = True
+    allowed_strata: list[Literal["protocol", "ports", "product", "time_window"]] = [
+        "protocol", "ports", "product", "time_window"
+    ]
+    claim_scope: Literal["matched_background"] = "matched_background"
+
+
+class FeatureEligibilityConfig(StrictConfigModel):
+    min_distinct_anchors: int = Field(default=2, ge=1)
+    min_anchor_support: float = Field(default=0.5, ge=0, le=1)
+    max_background_prevalence: float = Field(default=0.1, ge=0, le=1)
+    require_human_review: Literal[True] = True
+    block_shared_or_default: Literal[True] = True
+    block_unstable_or_unavailable: Literal[True] = True
+
+
+class QueryFreezePolicyConfig(StrictConfigModel):
+    require_human_review: Literal[True] = True
+    require_passing_bounded_precheck: Literal[True] = True
+    performance_claim_allowed_in_precheck: Literal[False] = False
+    max_precheck_pages: int = Field(default=2, ge=1)
+    default_interval_hours: int = Field(default=168, ge=1)
+    max_alerts_per_run: int = Field(default=20, ge=1)
+    max_credits_per_run: float = Field(default=100, gt=0)
+
+
+class PhaseEPolicyConfig(StrictConfigModel):
+    require_record_observed_at: Literal[True] = True
+    unresolved_time_status: Literal["prospective_time_unresolved"] = "prospective_time_unresolved"
+    require_raw_manifest_hash: Literal[True] = True
+    require_independent_source_family: Literal[True] = True
+    block_discovery_feature_reuse: Literal[True] = True
+    block_pre_candidate_evidence: Literal[True] = True
+    require_separate_human_adjudicator: Literal[True] = True
+    append_only_grade_history: Literal[True] = True
+
+
 class CtiIocExtractionConfig(StrictConfigModel):
     """CTI 원문 structured extraction의 모델·입력 상한·live gate 정책."""
 
@@ -145,6 +183,14 @@ class ProjectConfig(StrictConfigModel):
     cti_ioc_extraction: CtiIocExtractionConfig
     censys_collection: CensysCollectionConfig
     phase_b_policy: PhaseBPolicyConfig = Field(default_factory=PhaseBPolicyConfig)
+    background_policy: BackgroundPolicyConfig = Field(default_factory=BackgroundPolicyConfig)
+    feature_eligibility: FeatureEligibilityConfig = Field(
+        default_factory=FeatureEligibilityConfig
+    )
+    query_freeze_policy: QueryFreezePolicyConfig = Field(
+        default_factory=QueryFreezePolicyConfig
+    )
+    phase_e_policy: PhaseEPolicyConfig = Field(default_factory=PhaseEPolicyConfig)
     config_path: Path | None = Field(default=None, exclude=True)
 
     @field_validator("research_start_at")

@@ -192,6 +192,102 @@ class FingerprintSensitivity(StrEnum):
     RESTRICTED = "restricted"
 
 
+class FeatureFamily(StrEnum):
+    IDENTITY = "identity"
+    TLS = "tls"
+    HTTP = "http"
+    SERVICE = "service"
+    DEVICE = "device"
+    NETWORK = "network"
+    RELATION = "relation"
+
+
+class FeatureStability(StrEnum):
+    STABLE = "stable"
+    UNSTABLE = "unstable"
+    UNAVAILABLE = "unavailable"
+
+
+class FeatureEligibilityStatus(StrEnum):
+    CANDIDATE = "candidate"
+    BLOCKED = "blocked"
+
+
+class QueryCompositionType(StrEnum):
+    CTI_ONLY = "cti_only"
+    CTI_DERIVED = "cti_derived"
+    DERIVED_ONLY = "derived_only"
+    Q3_GRAPH_EXPANSION = "q3_graph_expansion"
+
+
+class ClauseOrigin(StrEnum):
+    CTI_DIRECT = "cti_direct"
+    DERIVED = "derived"
+
+
+class LogicalRole(StrEnum):
+    REQUIRED = "required"
+    ALTERNATIVE = "alternative"
+    EXCLUSION = "exclusion"
+    SCORE_ONLY = "score_only"
+
+
+class EvidenceRole(StrEnum):
+    DISCOVERY = "discovery"
+    VALIDATION = "validation"
+    CONTRADICTION = "contradiction"
+
+
+class OpportunityStatus(StrEnum):
+    DUE = "due"
+    MISSED = "missed"
+    LATE = "late"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    COMPLETE = "complete"
+
+
+class ProspectiveTimeStatus(StrEnum):
+    ELIGIBLE = "eligible"
+    PRE_FREEZE = "pre_freeze"
+    UNRESOLVED = "prospective_time_unresolved"
+
+
+class AdjudicationStatus(StrEnum):
+    POSITIVE = "positive"
+    NEGATIVE = "negative"
+    CONTRADICTED = "contradicted"
+    UNRESOLVED = "unresolved"
+    UNOBSERVABLE = "unobservable"
+
+
+class ValidationAvailability(StrEnum):
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    NOT_CHECKED = "not_checked"
+
+
+class QueryOperator(StrEnum):
+    AND = "AND"
+    OR = "OR"
+    NOT = "NOT"
+
+
+class CooccurrenceScope(StrEnum):
+    HOST = "host"
+    SERVICE = "service"
+    CERTIFICATE = "certificate"
+    NAME = "name"
+    GRAPH_EDGE = "graph_edge"
+
+
+class DesignPrecheckStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETE = "complete"
+    PARTIAL_MAX_PAGES = "partial_max_pages"
+    FAILED = "failed"
+
+
 class EntityRelationType(StrEnum):
     OBSERVED_WITH = "observed_with"
     RESOLVES_TO = "resolves_to"
@@ -679,9 +775,404 @@ class EntityRelationRecord(StrictUTCModel):
     _available_at_utc = field_validator("available_at")(utc)
 
 
+class FeatureCatalogRecord(StrictUTCModel):
+    feature_id: str
+    feature_family: FeatureFamily
+    feature_type: str
+    canonical_value: str
+    canonical_value_hash: str
+    query_field: str | None = None
+    canonicalizer_version: str
+    extractor_version: str
+    first_available_at: datetime
+    stability: FeatureStability
+    shared_or_default: bool = False
+    source_fingerprint_id: str | None = None
+
+    _feature_available_utc = field_validator("first_available_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_feature(self) -> "FeatureCatalogRecord":
+        if not self.feature_type.strip() or not self.canonical_value.strip():
+            raise ValueError("feature type and canonical value are required")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.canonical_value_hash):
+            raise ValueError("canonical_value_hash must be SHA-256")
+        if self.stability is FeatureStability.STABLE and not self.query_field:
+            raise ValueError("stable feature requires a query field")
+        return self
+
+
+class FeatureObservationRecord(StrictUTCModel):
+    feature_observation_id: str
+    feature_id: str
+    observation_id: str
+    service_observation_id: str | None = None
+    query_run_id: str
+    observed_at: datetime | None = None
+    available_at: datetime
+
+    _feature_observed_utc = field_validator("observed_at")(
+        lambda value: None if value is None else utc(value)
+    )
+    _feature_observation_available_utc = field_validator("available_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_feature_observation_time(self) -> "FeatureObservationRecord":
+        if self.observed_at and self.observed_at > self.available_at:
+            raise ValueError("feature observation cannot be available before observation")
+        return self
+
+
+class EntityEpochRecord(StrictUTCModel):
+    entity_epoch_id: str
+    indicator_id: str
+    valid_from: datetime
+    valid_to: datetime | None = None
+    observation_ids: list[str]
+    identity_feature_ids: list[str]
+    resolution_version: str
+    available_at: datetime
+
+    _epoch_from_utc = field_validator("valid_from")(utc)
+    _epoch_to_utc = field_validator("valid_to")(
+        lambda value: None if value is None else utc(value)
+    )
+    _epoch_available_utc = field_validator("available_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_epoch(self) -> "EntityEpochRecord":
+        if not self.observation_ids:
+            raise ValueError("entity epoch requires observations")
+        if self.valid_to and self.valid_to < self.valid_from:
+            raise ValueError("entity epoch interval is reversed")
+        if self.available_at < self.valid_from:
+            raise ValueError("entity epoch availability predates validity")
+        return self
+
+
+class ReferenceSetRecord(StrictUTCModel):
+    reference_set_id: str
+    reference_version: str
+    cutoff_at: datetime
+    stratum: dict[str, Any]
+    sampling_frame: str
+    snapshot_manifest_hash: str
+    source_query_run_ids: list[str]
+    registered_at: datetime
+    claim_scope: str = "matched_background"
+
+    _reference_cutoff_utc = field_validator("cutoff_at")(utc)
+    _reference_registered_utc = field_validator("registered_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_reference_set(self) -> "ReferenceSetRecord":
+        if not self.stratum or not self.sampling_frame.strip():
+            raise ValueError("reference stratum and sampling frame are required")
+        if not self.source_query_run_ids:
+            raise ValueError("reference set requires source query runs")
+        unknown = set(self.stratum) - {"protocol", "ports", "product", "time_window"}
+        if unknown:
+            raise ValueError("reference set contains unsupported strata")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.snapshot_manifest_hash):
+            raise ValueError("reference snapshot manifest hash must be SHA-256")
+        if self.claim_scope == "global_rarity":
+            raise ValueError("matched reference set cannot claim global rarity")
+        if self.registered_at < self.cutoff_at:
+            raise ValueError("reference set cannot be registered before cutoff")
+        window = self.stratum.get("time_window")
+        if window is not None:
+            if not isinstance(window, dict) or set(window) != {"start", "end"}:
+                raise ValueError("reference time_window requires start and end")
+            start = datetime.fromisoformat(str(window["start"]).replace("Z", "+00:00"))
+            end = datetime.fromisoformat(str(window["end"]).replace("Z", "+00:00"))
+            if start.tzinfo is None or end.tzinfo is None or end < start:
+                raise ValueError("reference time_window is invalid")
+        ports = self.stratum.get("ports", [])
+        if (not isinstance(ports, list)
+                or any(not isinstance(port, int) or not 1 <= port <= 65535 for port in ports)):
+            raise ValueError("reference ports stratum is invalid")
+        return self
+
+
+class ReferenceMembershipRecord(StrictUTCModel):
+    membership_id: str
+    reference_set_id: str
+    observation_id: str
+    observable: bool
+    exclusion_reason: str | None = None
+    matched_at: datetime
+
+    _membership_matched_utc = field_validator("matched_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_membership(self) -> "ReferenceMembershipRecord":
+        if self.observable == bool(self.exclusion_reason):
+            raise ValueError("observable membership and exclusion reason disagree")
+        return self
+
+
+class FeatureStatSnapshotRecord(StrictUTCModel):
+    stat_snapshot_id: str
+    feature_id: str
+    reference_set_id: str
+    cutoff_at: datetime
+    anchor_observation_ids: list[str]
+    anchor_source_ids: list[str]
+    background_membership_ids: list[str]
+    anchor_numerator: int = Field(ge=0)
+    anchor_denominator: int = Field(ge=0)
+    background_numerator: int = Field(ge=0)
+    background_denominator: int = Field(ge=0)
+    anchor_support: float = Field(ge=0, le=1)
+    background_prevalence: float = Field(ge=0, le=1)
+    reference_lift: float = Field(ge=0)
+    anchor_ci_low: float = Field(ge=0, le=1)
+    anchor_ci_high: float = Field(ge=0, le=1)
+    background_ci_low: float = Field(ge=0, le=1)
+    background_ci_high: float = Field(ge=0, le=1)
+    source_manifest_hash: str
+    computed_at: datetime
+
+    _stat_cutoff_utc = field_validator("cutoff_at")(utc)
+    _stat_computed_utc = field_validator("computed_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_stat_counts(self) -> "FeatureStatSnapshotRecord":
+        if self.anchor_numerator > self.anchor_denominator:
+            raise ValueError("anchor numerator exceeds denominator")
+        if self.background_numerator > self.background_denominator:
+            raise ValueError("background numerator exceeds denominator")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.source_manifest_hash):
+            raise ValueError("feature statistic source manifest must be SHA-256")
+        if self.background_ci_low > self.background_ci_high:
+            raise ValueError("background confidence interval is reversed")
+        if self.anchor_ci_low > self.anchor_ci_high:
+            raise ValueError("anchor confidence interval is reversed")
+        if self.computed_at < self.cutoff_at:
+            raise ValueError("feature statistic cannot be computed before cutoff")
+        return self
+
+
+class FeatureEligibilityAssessmentRecord(StrictUTCModel):
+    assessment_id: str
+    feature_id: str
+    stat_snapshot_id: str
+    status: FeatureEligibilityStatus
+    reason_codes: list[str]
+    min_distinct_anchors: int = Field(default=2, ge=1)
+    min_anchor_support: float = Field(default=0.5, ge=0, le=1)
+    max_background_prevalence: float = Field(default=0.1, ge=0, le=1)
+    assessed_at: datetime
+
+    _feature_assessed_utc = field_validator("assessed_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_eligibility_status(self) -> "FeatureEligibilityAssessmentRecord":
+        if (self.status is FeatureEligibilityStatus.CANDIDATE) == bool(self.reason_codes):
+            raise ValueError("feature eligibility status and reasons disagree")
+        return self
+
+
+class FeatureEligibilityReviewRecord(StrictUTCModel):
+    review_id: str
+    assessment_id: str
+    decision: ReviewerStatus
+    reviewer_id: str
+    reviewed_at: datetime
+    notes_hash: str
+
+    _feature_reviewed_utc = field_validator("reviewed_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_feature_review(self) -> "FeatureEligibilityReviewRecord":
+        if self.decision is ReviewerStatus.PENDING:
+            raise ValueError("feature eligibility review must be accepted or rejected")
+        if not self.reviewer_id.strip() or not re.fullmatch(r"[0-9a-f]{64}", self.notes_hash):
+            raise ValueError("feature eligibility review provenance is invalid")
+        return self
+
+
+class QueryClauseRecord(StrictUTCModel):
+    clause_id: str
+    parent_clause_id: str | None = None
+    feature_origin: ClauseOrigin
+    logical_role: LogicalRole
+    evidence_role: EvidenceRole = EvidenceRole.DISCOVERY
+    operator: QueryOperator
+    cooccurrence_scope: CooccurrenceScope
+    query_field: str
+    canonical_value: str
+    source_assertion_id: str | None = None
+    source_precheck_id: str | None = None
+    source_feature_id: str | None = None
+    node_id: str | None = None
+    canonicalizer_version: str
+    available_at: datetime
+
+    _clause_available_utc = field_validator("available_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_clause_source(self) -> "QueryClauseRecord":
+        if not self.query_field.strip() or not self.canonical_value.strip():
+            raise ValueError("query clause field and value are required")
+        if self.evidence_role is not EvidenceRole.DISCOVERY:
+            raise ValueError("query clauses can use discovery evidence only")
+        cti_sources = bool(self.source_assertion_id or self.source_precheck_id)
+        derived_source = bool(self.source_feature_id)
+        if self.feature_origin is ClauseOrigin.CTI_DIRECT:
+            if not cti_sources or derived_source:
+                raise ValueError("CTI clause provenance is invalid")
+        elif not derived_source or cti_sources:
+            raise ValueError("derived clause provenance is invalid")
+        expected_operator = {
+            LogicalRole.REQUIRED: QueryOperator.AND,
+            LogicalRole.ALTERNATIVE: QueryOperator.OR,
+            LogicalRole.EXCLUSION: QueryOperator.NOT,
+        }.get(self.logical_role)
+        if expected_operator is None or self.operator is not expected_operator:
+            raise ValueError("query clause logical role and operator disagree")
+        if self.parent_clause_id is not None:
+            raise ValueError("nested query clauses are not supported in Stage 5")
+        return self
+
+
+class QueryDesignRecord(StrictUTCModel):
+    design_id: str
+    query_id: str
+    query_version: str
+    variant: str
+    query_class: QueryClass
+    composition_type: QueryCompositionType
+    clause_ids: list[str]
+    rendered_query: str
+    query_hash: str
+    cutoff_at: datetime
+    background_snapshot_ids: list[str]
+    api_schema_version: str
+    parser_version: str
+    normalizer_version: str
+    entity_resolution_version: str
+    config_hash: str
+    registered_at: datetime
+
+    _design_cutoff_utc = field_validator("cutoff_at")(utc)
+    _design_registered_utc = field_validator("registered_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_design(self) -> "QueryDesignRecord":
+        if not self.variant.strip() or not self.clause_ids:
+            raise ValueError("query design variant and clauses are required")
+        if self.registered_at < self.cutoff_at:
+            raise ValueError("query design cannot be registered before cutoff")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.query_hash):
+            raise ValueError("query design hash must be SHA-256")
+        return self
+
+
+class QueryBudgetScheduleRecord(StrictUTCModel):
+    schedule_id: str
+    design_id: str
+    interval_hours: int = Field(ge=1)
+    starts_at: datetime
+    max_alerts_per_run: int = Field(ge=1)
+    max_credits_per_run: float = Field(gt=0)
+    max_pages_per_run: int = Field(ge=1)
+    tie_break_rule: str
+    registered_at: datetime
+
+    _schedule_start_utc = field_validator("starts_at")(utc)
+    _schedule_registered_utc = field_validator("registered_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_schedule(self) -> "QueryBudgetScheduleRecord":
+        if not self.tie_break_rule.strip():
+            raise ValueError("query schedule tie-break rule is required")
+        if self.starts_at < self.registered_at:
+            raise ValueError("query schedule cannot start before registration")
+        return self
+
+
+class QueryDesignPrecheckRecord(StrictUTCModel):
+    precheck_id: str
+    design_id: str
+    status: DesignPrecheckStatus
+    page_count: int = Field(default=0, ge=0)
+    hit_count: int = Field(default=0, ge=0)
+    next_token_present: bool = False
+    syntax_valid: bool = False
+    broad_or_shared: bool = False
+    cost_exceeded: bool = False
+    performance_claim_allowed: bool = False
+    raw_manifest_hash: str | None = None
+    recorded_at: datetime
+    failure_reason: str | None = None
+
+    _design_precheck_recorded_utc = field_validator("recorded_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_design_precheck(self) -> "QueryDesignPrecheckRecord":
+        if self.performance_claim_allowed:
+            raise ValueError("development precheck cannot support performance claims")
+        if self.status in {DesignPrecheckStatus.COMPLETE, DesignPrecheckStatus.PARTIAL_MAX_PAGES}:
+            if not self.raw_manifest_hash:
+                raise ValueError("complete or partial precheck requires raw manifest hash")
+        if self.status is DesignPrecheckStatus.FAILED and not self.failure_reason:
+            raise ValueError("failed design precheck requires failure reason")
+        if self.raw_manifest_hash and not re.fullmatch(r"[0-9a-f]{64}", self.raw_manifest_hash):
+            raise ValueError("design precheck raw manifest must be SHA-256")
+        return self
+
+
+class QueryDesignReviewRecord(StrictUTCModel):
+    review_id: str
+    design_id: str
+    precheck_id: str
+    decision: ReviewerStatus
+    reviewer_id: str
+    reviewed_at: datetime
+    notes_hash: str
+
+    _design_reviewed_utc = field_validator("reviewed_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_design_review(self) -> "QueryDesignReviewRecord":
+        if self.decision is ReviewerStatus.PENDING:
+            raise ValueError("query design review must be accepted or rejected")
+        if not self.reviewer_id.strip() or not re.fullmatch(r"[0-9a-f]{64}", self.notes_hash):
+            raise ValueError("query design review provenance is invalid")
+        return self
+
+
+class QueryFreezeManifestRecord(StrictUTCModel):
+    freeze_manifest_id: str
+    query_id: str
+    design_id: str
+    query_hash: str
+    source_manifest_hash: str
+    query_cutoff_at: datetime
+    schedule_id: str
+    review_id: str
+    frozen_at: datetime
+    valid_for_test_from: datetime
+
+    _manifest_cutoff_utc = field_validator("query_cutoff_at")(utc)
+    _manifest_frozen_utc = field_validator("frozen_at")(utc)
+    _manifest_valid_utc = field_validator("valid_for_test_from")(utc)
+
+    @model_validator(mode="after")
+    def _validate_freeze_manifest(self) -> "QueryFreezeManifestRecord":
+        if self.valid_for_test_from < self.frozen_at:
+            raise ValueError("freeze manifest valid-from predates freeze")
+        for name in ("query_hash", "source_manifest_hash"):
+            if not re.fullmatch(r"[0-9a-f]{64}", getattr(self, name)):
+                raise ValueError(f"{name} must be SHA-256")
+        return self
+
+
 class QueryRecord(StrictUTCModel):
     query_id: str
     query_version: str
+    query_variant: str = "primary"
     query_class: QueryClass
     query_text: str
     query_hash: str
@@ -706,6 +1197,8 @@ class QueryRecord(StrictUTCModel):
 
     @model_validator(mode="after")
     def _validate_source_provenance_time(self) -> "QueryRecord":
+        if not self.query_variant.strip():
+            raise ValueError("query variant is required")
         if (
             self.source_assertion_ids
             and not self.source_indicator_ids
@@ -735,6 +1228,146 @@ class QueryExecutionRecord(StrictUTCModel):
 
     _cutoff_utc = field_validator("cutoff_time")(utc)
     _executed_utc = field_validator("executed_at")(utc)
+
+
+class ObservationOpportunityRecord(StrictUTCModel):
+    opportunity_id: str
+    query_id: str
+    query_version: str
+    query_hash: str
+    schedule_id: str
+    entity_epoch_id: str
+    due_at: datetime
+    window_end: datetime
+    status: OpportunityStatus
+    query_run_id: str | None = None
+    recorded_at: datetime
+    reason: str | None = None
+
+    _opportunity_due_utc = field_validator("due_at")(utc)
+    _opportunity_end_utc = field_validator("window_end")(utc)
+    _opportunity_recorded_utc = field_validator("recorded_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_opportunity(self) -> "ObservationOpportunityRecord":
+        if self.window_end <= self.due_at:
+            raise ValueError("observation opportunity window must be positive")
+        if self.status in {OpportunityStatus.PARTIAL, OpportunityStatus.FAILED,
+                           OpportunityStatus.COMPLETE, OpportunityStatus.LATE}:
+            if not self.query_run_id:
+                raise ValueError("executed opportunity status requires query_run_id")
+        if self.status in {OpportunityStatus.MISSED, OpportunityStatus.FAILED} and not self.reason:
+            raise ValueError("missed or failed opportunity requires reason")
+        return self
+
+
+class ProspectiveObservationEventRecord(StrictUTCModel):
+    event_id: str
+    opportunity_id: str
+    query_run_id: str
+    observation_id: str
+    entity_epoch_id: str
+    indicator_id: str
+    observed_at: datetime | None = None
+    collected_at: datetime
+    time_status: ProspectiveTimeStatus
+    record_time_statuses: dict[str, ProspectiveTimeStatus] = Field(default_factory=dict)
+    raw_record_hash: str
+    recorded_at: datetime
+
+    _prospective_observed_utc = field_validator("observed_at")(
+        lambda value: None if value is None else utc(value)
+    )
+    _prospective_collected_utc = field_validator("collected_at")(utc)
+    _prospective_recorded_utc = field_validator("recorded_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_prospective_time(self) -> "ProspectiveObservationEventRecord":
+        if self.time_status is ProspectiveTimeStatus.UNRESOLVED and self.observed_at is not None:
+            raise ValueError("unresolved prospective time must not carry observed_at")
+        if self.time_status is not ProspectiveTimeStatus.UNRESOLVED and self.observed_at is None:
+            raise ValueError("resolved prospective time requires observed_at")
+        return self
+
+
+class CandidateRecord(StrictUTCModel):
+    candidate_id: str
+    query_id: str
+    query_version: str
+    query_hash: str
+    entity_epoch_id: str
+    indicator_id: str
+    first_candidate_at: datetime
+    first_observation_event_id: str
+    discovery_feature_ids: list[str] = Field(default_factory=list)
+    discovery_source_family_ids: list[str] = Field(default_factory=list)
+
+    _first_candidate_utc = field_validator("first_candidate_at")(utc)
+
+
+class CandidateEvidenceRecord(StrictUTCModel):
+    evidence_id: str
+    candidate_id: str
+    role: EvidenceRole
+    evidence_type: str
+    source_id: str
+    source_family_id: str
+    feature_ids: list[str] = Field(default_factory=list)
+    observed_at: datetime | None = None
+    available_at: datetime
+    availability: ValidationAvailability = ValidationAvailability.AVAILABLE
+    supports_candidate: bool | None = None
+    recorded_at: datetime
+
+    _evidence_observed_utc = field_validator("observed_at")(
+        lambda value: None if value is None else utc(value)
+    )
+    _candidate_evidence_available_utc = field_validator("available_at")(utc)
+    _candidate_evidence_recorded_utc = field_validator("recorded_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_candidate_evidence(self) -> "CandidateEvidenceRecord":
+        if not self.source_family_id.strip() or not self.source_id.strip():
+            raise ValueError("candidate evidence source provenance is required")
+        if self.observed_at and self.observed_at > self.available_at:
+            raise ValueError("candidate evidence observed_at cannot exceed available_at")
+        if self.role is EvidenceRole.DISCOVERY and self.supports_candidate is not True:
+            raise ValueError("discovery evidence must support the candidate")
+        if self.role is EvidenceRole.CONTRADICTION and self.supports_candidate is not False:
+            raise ValueError("contradiction evidence must oppose the candidate")
+        return self
+
+
+class CandidateAdjudicationRecord(StrictUTCModel):
+    adjudication_id: str
+    candidate_id: str
+    status: AdjudicationStatus
+    reason_codes: list[str]
+    evidence_ids: list[str] = Field(default_factory=list)
+    adjudicator_id: str
+    implementation_agent_id: str
+    adjudicated_at: datetime
+
+    _adjudicated_utc = field_validator("adjudicated_at")(utc)
+
+    @model_validator(mode="after")
+    def _validate_adjudication(self) -> "CandidateAdjudicationRecord":
+        if not self.reason_codes:
+            raise ValueError("candidate adjudication requires reason codes")
+        if not self.adjudicator_id.strip() or self.adjudicator_id == self.implementation_agent_id:
+            raise ValueError("human adjudicator must be separate from implementation agent")
+        return self
+
+
+class CandidateGradeEventRecord(StrictUTCModel):
+    grade_event_id: str
+    candidate_id: str
+    adjudication_id: str
+    grade: str
+    previous_grade_event_id: str | None = None
+    graded_at: datetime
+
+    _graded_utc = field_validator("graded_at")(utc)
 
 
 class ReuseSourceRecord(StrictUTCModel):

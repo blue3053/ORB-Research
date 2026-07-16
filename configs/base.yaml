@@ -82,3 +82,35 @@ phase_b_policy:
   precheck_page_budget: 2
   exclude_partial_prechecks_from_q2: true
   require_eligible_precheck_for_q2: true
+
+background_policy:
+  require_matched_background: true
+  allowed_strata: [protocol, ports, product, time_window]
+  claim_scope: matched_background
+
+feature_eligibility:
+  min_distinct_anchors: 2
+  min_anchor_support: 0.5
+  max_background_prevalence: 0.1
+  require_human_review: true
+  block_shared_or_default: true
+  block_unstable_or_unavailable: true
+
+query_freeze_policy:
+  require_human_review: true
+  require_passing_bounded_precheck: true
+  performance_claim_allowed_in_precheck: false
+  max_precheck_pages: 2
+  default_interval_hours: 168
+  max_alerts_per_run: 20
+  max_credits_per_run: 100
+
+phase_e_policy:
+  require_record_observed_at: true
+  unresolved_time_status: prospective_time_unresolved
+  require_raw_manifest_hash: true
+  require_independent_source_family: true
+  block_discovery_feature_reuse: true
+  block_pre_candidate_evidence: true
+  require_separate_human_adjudicator: true
+  append_only_grade_history: true

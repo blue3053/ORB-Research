@@ -42,6 +42,20 @@ class FakeLiveFetcher:
 
 
 class CliIntegrationTests(unittest.TestCase):
+    def test_phase_c_commands_are_exposed(self):
+        commands = cli.build_parser()._subparsers._group_actions[0].choices
+        self.assertTrue({
+            "feature-build", "feature-build-background", "feature-assess",
+            "feature-review", "cti-audit-phase-c",
+        } <= set(commands))
+
+    def test_phase_d_commands_are_exposed(self):
+        commands = cli.build_parser()._subparsers._group_actions[0].choices
+        self.assertTrue({
+            "query-compose", "query-register-schedule", "query-record-precheck",
+            "query-review", "query-freeze-designed", "cti-audit-phase-d",
+        } <= set(commands))
+
     def test_register_generic_query_preserves_source_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             db = Path(directory) / "registry.sqlite"
